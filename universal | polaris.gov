@@ -1,0 +1,3573 @@
+-- // universal | polaris.gov
+-- // Version: 2.7.1
+-- ============================================================
+-- CHANGELOG vs 2.7.0:
+--   FIX  HITBOX: Reverted direct-resize approach (caused frozen visuals by
+--         breaking Motor6D joint offsets). Back to ghost-part strategy:
+--         a WeldConstraint-attached SmoothPlastic part with CanQuery=true
+--         so workspace raycasts hit it without touching the original rig.
+--   FIX  CONFIG: Movement.Fly, Spin, TPWalk, ClickTP/TweenTP, Orbit*, Music
+--         Volume/Pitch/Looped/ID were all missing from SerializeState.
+--         Added all missing fields; ApplyDeserializedState updated to match.
+--   ADD  DISCORD: Persistent bottom-right watermark link + Misc tab entry
+--         with a "Copy Link" button.
+--   CHG  LOADING SCREEN: Extended to 5 seconds.
+-- ============================================================
+-- CHANGELOG vs 2.6.2:
+--   FIX  SLIDER: _activeSlide was declared after CreateTab, making slider
+--         callbacks write to a different variable than the InputService
+--         listeners read from. Moved declaration before CreateTab.
+--   FIX  HITBOX: Revamped to directly resize original character parts for
+--         genuine hit-expansion in client-side detection games. Team-check
+--         added; cosmetic visual uses SmoothPlastic + optional Highlight.
+--         Parts list simplified to 7 canonical parts.
+--   FIX  ESP:   Highlight was parented to character BEFORE the distance
+--         check, so out-of-range players still had a highlight. Moved
+--         Highlight logic after distance / on-screen guard.
+--   FIX  GODMODE: Added Heartbeat loop so health is continuously restored;
+--         BreakJointsOnDeath set to false.
+--   FIX  RAYCAST: Wall-checks now march past CanCollide=false objects
+--         instead of treating them as solid walls.
+--   ADD  AIMBOT: Selectable target body part (Head/Torso/HRP/Arms/Legs).
+--   ADD  AIMBOT: Notifies who is being tracked and live damage counter.
+--   ADD  HITBOX: Team-check ignores teammates.
+--   ADD  MISC:   Kill-script button (full cleanup + GUI destroy).
+--   ADD  MUSIC:  Custom user presets saved with configs.
+--   ADD  LOADING SCREEN: Welcomes the local player on inject.
+--   ADD  COLOR PICKER: Rainbow toggle embedded in color picker rows.
+--   ADD  CONFIG: GUI controls sync visually when a config is loaded.
+--   CHG  CONFIG: Autoload on startup is DISABLED; user must load manually.
+-- ============================================================
+ 
+-- ============================================================
+-- // RE-INJECTION CLEANUP
+-- ============================================================
+-- Destroy any previous instance of the script so re-injecting
+-- doesn't leave ghost GUIs, Drawing objects, or stale sounds.
+do
+    -- 1. Destroy old ScreenGui instances
+    local _cgOk2, _cg2 = pcall(function() return game:GetService("CoreGui") end)
+    local _root = (_cgOk2 and _cg2) and _cg2 or game:GetService("Players").LocalPlayer:FindFirstChild("PlayerGui")
+    if _root then
+        for _, name in ipairs({"PolarisGUI","PolarisWatermark"}) do
+            local old = _root:FindFirstChild(name)
+            if old then old:Destroy() end
+        end
+    end
+    -- Also clean up PlayerGui copy just in case
+    local pg = game:GetService("Players").LocalPlayer:FindFirstChild("PlayerGui")
+    if pg then
+        for _, name in ipairs({"PolarisGUI","PolarisWatermark"}) do
+            local old = pg:FindFirstChild(name)
+            if old then old:Destroy() end
+        end
+    end
+ 
+    -- 2. FIX: Destroy old Drawing objects (FOV circle + TB crosshair).
+    --    Previous run stores them in _G._PolarisDrawings.
+    if _G._PolarisDrawings then
+        for _, d in ipairs(_G._PolarisDrawings) do
+            pcall(function() d:Remove() end)
+        end
+        _G._PolarisDrawings = nil
+    end
+ 
+    -- 3. FIX: Destroy old PolarisMusic sound so re-injection doesn't duplicate it.
+    local _ss = game:GetService("SoundService")
+    local _oldMusic = _ss:FindFirstChild("PolarisMusic")
+    if _oldMusic then _oldMusic:Destroy() end
+end
+ 
+-- ============================================================
+-- // SERVICES
+-- ============================================================
+ 
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+local Lighting         = game:GetService("Lighting")
+local SoundService     = game:GetService("SoundService")
+local HttpService      = game:GetService("HttpService")
+ 
+local LocalPlayer = Players.LocalPlayer
+local Mouse       = LocalPlayer:GetMouse()
+-- NOTE: 'Camera' intentionally omitted — script always calls GetCamera() to
+--       pick up the current camera reference rather than caching a stale one.
+ 
+-- ============================================================
+-- // HELPERS
+-- ============================================================
+ 
+local function GetCamera()  return workspace.CurrentCamera end
+ 
+local function GetCharacter(p) return p and p.Character end
+ 
+local function GetRoot(p)
+    local c = GetCharacter(p)
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+ 
+local function GetHumanoid(p)
+    local c = GetCharacter(p)
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+ 
+local function IsAlive(p)
+    local h = GetHumanoid(p)
+    return h ~= nil and h.Health > 0
+end
+ 
+-- Returns true when both players are on the same non-nil Roblox Team
+local function IsTeammate(player)
+    if not LocalPlayer.Team then return false end
+    return player.Team ~= nil and player.Team == LocalPlayer.Team
+end
+ 
+-- viewport-space screen position + on-screen bool
+local function W2S(pos)
+    local v, on = GetCamera():WorldToViewportPoint(pos)
+    return Vector2.new(v.X, v.Y), on
+end
+ 
+local function CopyToClipboard(text)
+    if setclipboard then
+        setclipboard(text)
+    elseif Clipboard and Clipboard.set then
+        Clipboard.set(text)
+    end
+end
+ 
+-- ============================================================
+-- // DEFAULTS
+-- ============================================================
+ 
+local Defaults = { WalkSpeed = 16, JumpPower = 50 }
+ 
+local function RefreshDefaults()
+    local h = GetHumanoid(LocalPlayer)
+    if h then Defaults.WalkSpeed = h.WalkSpeed; Defaults.JumpPower = h.JumpPower end
+end
+RefreshDefaults()
+ 
+-- ============================================================
+-- // LIGHTING DEFAULTS
+-- ============================================================
+ 
+local LDefault = {
+    Ambient        = Lighting.Ambient,
+    OutdoorAmbient = Lighting.OutdoorAmbient,
+    Brightness     = Lighting.Brightness,
+    GlobalShadows  = Lighting.GlobalShadows,
+    FogEnd         = Lighting.FogEnd,
+    FogStart       = Lighting.FogStart,
+}
+local AtmoDefault  = {}
+local PostFXSaved  = {}
+ 
+local _ia = Lighting:FindFirstChildOfClass("Atmosphere")
+if _ia then
+    pcall(function() AtmoDefault.Density  = _ia.Density  end)
+    pcall(function() AtmoDefault.Haze     = _ia.Haze     end)
+    pcall(function() AtmoDefault.Glare    = _ia.Glare    end)
+    pcall(function() AtmoDefault.FogBlend = _ia.FogBlend end)
+end
+for _, fx in ipairs(Lighting:GetChildren()) do
+    if fx:IsA("PostEffect") then PostFXSaved[fx] = fx.Enabled end
+end
+ 
+-- ============================================================
+-- // STATE
+-- ============================================================
+ 
+local State = {
+    Aimbot = {
+        Enabled            = false,
+        KeepLocked         = false,
+        Smoothness         = 0.5,
+        FOV                = 150,
+        Color              = Color3.fromRGB(255, 0, 0),
+        LockKey            = "MouseButton2",
+        WallCheck          = false,
+        Prediction         = false,
+        PredictionStrength = 0.065,
+        TeamCheck          = false,
+        RainbowFOV         = false,
+        RainbowSpeed       = 0.4,
+        TargetPart         = "Head",   -- selectable aim bone
+    },
+    ESP = {
+        Enabled      = false,
+        Box          = false,
+        Skeleton     = false,
+        Names        = false,
+        Distance     = false,
+        Highlight    = false,
+        Tracer       = false,
+        Color        = Color3.fromRGB(255, 255, 255),
+        Rainbow      = false,
+        RainbowSpeed = 0.4,         -- hue units/sec
+        TeamCheck    = false,
+        TeamMode     = "hide",
+        TeamColor    = Color3.fromRGB(0, 255, 120),
+        MaxDist      = 500,
+    },
+    Movement = {
+        TPWalk            = false,
+        TPWalkTween       = false,
+        TPWalkSpeed       = 50,
+        WalkSpeed         = false,
+        WalkSpeedValue    = 16,
+        JumpPower         = false,
+        JumpPowerValue    = 50,
+        Fly               = false,
+        FlySpeed          = 50,
+        Spin              = false,
+        SpinSpeed         = 20,
+        ClickTweenTP      = false,
+        ClickTweenTPSpeed = 5,
+        ClickTP           = false,
+        InfJump           = false,
+        Noclip            = false,
+        GodMode           = false,
+        Orbit             = false,
+        OrbitSpeed        = 20,
+        OrbitRadius       = 5,
+        OrbitMode         = "click",
+        OrbitCooldown     = 1,
+    },
+    Music = {
+        ID            = "",
+        Volume        = 0.5,
+        Pitch         = 1,
+        Looped        = false,
+        Playing       = false,
+        CustomPresets = {},   -- {name=str, id=str}
+    },
+    CameraFOV  = 70,
+    Fullbright = false,
+    NoFog      = false,
+    NoShadows  = false,
+    FPSBoost   = false,
+    AntiFling  = false,
+    Triggerbot = {
+        Enabled   = false,
+        Spam      = false,
+        WallCheck = false,   -- fully independent of Aimbot.WallCheck
+        TeamCheck = false,   -- fully independent of Aimbot.TeamCheck
+        Radius    = 15,
+        Delay     = 0.08,
+    },
+    Hitbox = {
+        Enabled      = false,
+        Size         = 4,
+        Color        = Color3.fromRGB(255, 60, 60),
+        Highlight    = false,
+        TeamCheck    = true,
+        Parts = {
+            Head             = true,
+            Torso            = true,   -- R6
+            UpperTorso       = true,   -- R15
+            HumanoidRootPart = false,
+            ["Right Arm"]    = false,
+            ["Left Arm"]     = false,
+            ["Right Leg"]    = false,
+            ["Left Leg"]     = false,
+        },
+    },
+}
+ 
+-- ============================================================
+-- // CONNECTION MANAGER
+-- ============================================================
+ 
+local Connections = {}
+ 
+local function Conn(name, c)
+    if Connections[name] then Connections[name]:Disconnect() end
+    Connections[name] = c
+end
+ 
+local function Drop(name)
+    if Connections[name] then
+        Connections[name]:Disconnect()
+        Connections[name] = nil
+    end
+end
+ 
+-- ============================================================
+-- // MISC STORAGE
+-- ============================================================
+ 
+local ESPObjects    = {}
+local TweenTPActive = false
+local LockedTarget  = nil
+local NoclipParts   = {}
+ 
+local _vpCenter = Vector2.new(800, 450)
+ 
+local OrbitTarget    = nil
+local OrbitAngle     = 0
+local OrbitAutoTimer = 0
+ 
+local FPSParticleCache = {}
+ 
+-- Separate rainbow hues: aimbot and ESP are independent
+local _rainbowHueAimbot = 0
+local _rainbowHueESP    = 0
+ 
+-- Triggerbot scan state
+local _tbWasInView = false
+local _tbSpamTimer = 0
+ 
+-- FIX SLIDER: must be declared here (before CreateTab closures capture it)
+-- so the MouseButton1Down callbacks and the InputService listeners share the
+-- SAME upvalue.  Previously it was declared after the tab-building block,
+-- meaning slider callbacks wrote to an inaccessible upvalue while the
+-- InputService listeners read a different one — sliders never moved.
+local _activeSlide = nil
+ 
+-- Damage tracking for aimbot notification
+local _lastTargetName   = ""
+local _lastTargetHP     = nil
+local _totalDamage      = 0
+ 
+-- GUI setter registry: allows config loads to update visual widgets
+local GUISetters = {}   -- { get=fn, set=fn }
+local function RegisterSetter(getter, setter)
+    table.insert(GUISetters, { get=getter, set=setter })
+end
+local function SyncGUI()
+    for _, e in ipairs(GUISetters) do
+        pcall(function() e.set(e.get()) end)
+    end
+end
+ 
+-- ============================================================
+-- // AIMBOT ENGINE
+-- ============================================================
+ 
+-- Raw raycast: returns true if targetPart is unobstructed from local head.
+-- FIX: Marches through CanCollide=false objects (decals, triggers, etc.)
+--      so transparent/non-solid map geometry doesn't count as a wall.
+local function RaycastVisible(targetPart)
+    local char = GetCharacter(LocalPlayer)
+    local head = char and char:FindFirstChild("Head")
+    if not head then return false end
+ 
+    local origin    = head.Position
+    local targetPos = targetPart.Position
+    local direction = targetPos - origin
+    local distance  = direction.Magnitude
+    if distance < 0.1 then return true end
+    local dirUnit   = direction.Unit
+ 
+    local excluded = { char }
+    local traveled = 0
+    local MAX_ITER = 20   -- safety cap
+ 
+    for _ = 1, MAX_ITER do
+        local rp = RaycastParams.new()
+        rp.FilterDescendantsInstances = excluded
+        rp.FilterType                 = Enum.RaycastFilterType.Exclude
+        local res = workspace:Raycast(origin + dirUnit * traveled,
+                                      dirUnit * (distance - traveled), rp)
+        if not res then
+            return true   -- clear line to target
+        end
+        local hit = res.Instance
+        -- Skip objects that have no collision (triggers, decorations, etc.)
+        if not hit.CanCollide then
+            table.insert(excluded, hit)
+            traveled = (res.Position - origin).Magnitude + 0.05
+            if traveled >= distance then return true end
+        elseif hit:IsDescendantOf(targetPart.Parent) then
+            return true   -- hit the target character itself
+        else
+            return false  -- solid obstacle
+        end
+    end
+    return false
+end
+ 
+-- Aimbot-specific visibility gate
+local function IsTargetVisible(targetPart)
+    if not State.Aimbot.WallCheck then return true end
+    return RaycastVisible(targetPart)
+end
+ 
+local function GetPredPos(part, rootPart)
+    local vel  = (State.Aimbot.Prediction and rootPart)
+        and rootPart.AssemblyLinearVelocity or Vector3.zero
+    local lead = State.Aimbot.Prediction and State.Aimbot.PredictionStrength or 0
+    return part.Position + vel * lead
+end
+ 
+-- Returns the target body part for the given character based on State.Aimbot.TargetPart
+local function GetAimPart(char)
+    if not char then return nil end
+    local partName = State.Aimbot.TargetPart or "Head"
+    -- Try exact name first
+    local p = char:FindFirstChild(partName)
+    if p and p:IsA("BasePart") then return p end
+    -- Fallback chain for rig differences
+    if partName == "Torso" then
+        return char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
+    elseif partName == "Head" then
+        return char:FindFirstChild("Head")
+    end
+    return char:FindFirstChild("HumanoidRootPart")
+end
+ 
+local function GetTargetSP(player, keepLocked)
+    if not player or not IsAlive(player) then return nil end
+    if State.Aimbot.TeamCheck and IsTeammate(player) then return nil end
+    local char = GetCharacter(player)
+    local aimPart = GetAimPart(char)
+    local root    = char and char:FindFirstChild("HumanoidRootPart")
+    if not aimPart then return nil end
+ 
+    local pred    = GetPredPos(aimPart, root)
+    local sp, on  = W2S(pred)
+    if not on then return nil end
+ 
+    if not keepLocked then
+        local mousePos = UserInputService:GetMouseLocation()
+        if (sp - mousePos).Magnitude > State.Aimbot.FOV then return nil end
+    end
+ 
+    if not IsTargetVisible(aimPart) then return nil end
+    return sp
+end
+ 
+local function AimScanTarget()
+    local mousePos       = UserInputService:GetMouseLocation()
+    local best, bestDist = nil, math.huge
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and IsAlive(p)
+        and not (State.Aimbot.TeamCheck and IsTeammate(p)) then
+            local char    = GetCharacter(p)
+            local aimPart = GetAimPart(char)
+            local root    = char and char:FindFirstChild("HumanoidRootPart")
+            if aimPart then
+                local pred   = GetPredPos(aimPart, root)
+                local sp, on = W2S(pred)
+                if on then
+                    local d = (sp - mousePos).Magnitude
+                    if d < State.Aimbot.FOV and d < bestDist and IsTargetVisible(aimPart) then
+                        bestDist = d; best = p
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+ 
+local function IsAimKeyActive()
+    local k = State.Aimbot.LockKey
+    if k == "MouseButton2" then
+        return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+    elseif k == "MouseButton1" then
+        return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+    elseif k == "MouseButton3" then
+        return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton3)
+    else
+        local ok, kc = pcall(function() return Enum.KeyCode[k] end)
+        if ok and kc then return UserInputService:IsKeyDown(kc) end
+    end
+    return false
+end
+ 
+local function RunAimbot()
+    if not State.Aimbot.Enabled then return end
+ 
+    local keyHeld = IsAimKeyActive()
+    if not keyHeld then
+        LockedTarget = nil
+        _lastTargetName = ""; _lastTargetHP = nil; _totalDamage = 0
+        return
+    end
+ 
+    local stayLocked = State.Aimbot.KeepLocked
+    local sp = GetTargetSP(LockedTarget, stayLocked)
+    if not sp then
+        LockedTarget = AimScanTarget()
+        if LockedTarget then
+            sp = GetTargetSP(LockedTarget, false)
+            -- Notify on new lock
+            if LockedTarget then
+                local name = LockedTarget.DisplayName or LockedTarget.Name
+                if name ~= _lastTargetName then
+                    _lastTargetName = name
+                    _lastTargetHP   = nil
+                    _totalDamage    = 0
+                    PolarisNotify("Aimbot", "Tracking: " .. name, 2)
+                end
+            end
+        end
+    end
+    if not LockedTarget or not sp then return end
+ 
+    -- Damage tracking
+    local hum = GetHumanoid(LockedTarget)
+    if hum then
+        local curHP = hum.Health
+        if _lastTargetHP ~= nil and curHP < _lastTargetHP then
+            local dmg = _lastTargetHP - curHP
+            _totalDamage = _totalDamage + dmg
+            PolarisNotify("Hit", string.format("%s  −%.0f hp  (total %.0f)", _lastTargetName, dmg, _totalDamage), 1.5)
+        end
+        _lastTargetHP = curHP
+    end
+ 
+    local char    = GetCharacter(LockedTarget)
+    local aimPart = GetAimPart(char)
+    local root    = char and char:FindFirstChild("HumanoidRootPart")
+    if not aimPart then LockedTarget = nil; return end
+ 
+    local aimPos  = GetPredPos(aimPart, root)
+    local smooth  = math.clamp(State.Aimbot.Smoothness, 0.01, 1)
+    local camCF   = GetCamera().CFrame
+    local dir     = (aimPos - camCF.Position).Unit
+    local tgtCF   = CFrame.new(camCF.Position, camCF.Position + dir)
+    GetCamera().CFrame = camCF:Lerp(tgtCF, smooth)
+end
+ 
+local function SetupAimbot()
+    LockedTarget = nil
+end
+ 
+-- ============================================================
+-- // ESP
+-- ============================================================
+ 
+local function GetSkelPairs(char)
+    if char:FindFirstChild("UpperTorso") then
+        return {
+            {"Head","UpperTorso"},
+            {"UpperTorso","LowerTorso"},
+            {"UpperTorso","RightUpperArm"},{"RightUpperArm","RightLowerArm"},{"RightLowerArm","RightHand"},
+            {"UpperTorso","LeftUpperArm"}, {"LeftUpperArm","LeftLowerArm"},  {"LeftLowerArm","LeftHand"},
+            {"LowerTorso","RightUpperLeg"},{"RightUpperLeg","RightLowerLeg"},{"RightLowerLeg","RightFoot"},
+            {"LowerTorso","LeftUpperLeg"}, {"LeftUpperLeg","LeftLowerLeg"},  {"LeftLowerLeg","LeftFoot"},
+        }
+    else
+        return {
+            {"Head","Torso"},
+            {"Torso","Left Arm"},{"Torso","Right Arm"},
+            {"Torso","Left Leg"},{"Torso","Right Leg"},
+        }
+    end
+end
+ 
+local function RebuildSkeleton(d, char)
+    for _, s in ipairs(d.Skeleton) do pcall(function() s.line:Remove() end) end
+    d.Skeleton = {}
+    d.lastChar = char
+    for _, pair in ipairs(GetSkelPairs(char)) do
+        local ln     = Drawing.new("Line")
+        ln.Visible   = false
+        ln.Color     = State.ESP.Color
+        ln.Thickness = 1
+        table.insert(d.Skeleton, { line = ln, parts = pair })
+    end
+end
+ 
+local function ClearESPEntry(d)
+    pcall(function() d.Box.Visible       = false end)
+    pcall(function() d.Name.Visible      = false end)
+    pcall(function() d.Distance.Visible  = false end)
+    pcall(function() d.Tracer.Visible    = false end)
+    pcall(function() d.TeamLabel.Visible = false end)
+    pcall(function() if d.Highlight.Parent ~= nil then d.Highlight.Parent = nil end end)
+    for _, s in ipairs(d.Skeleton) do pcall(function() s.line.Visible = false end) end
+end
+ 
+local function DestroyESPEntry(d)
+    ClearESPEntry(d)
+    pcall(function() d.Box:Remove()       end)
+    pcall(function() d.Name:Remove()      end)
+    pcall(function() d.Distance:Remove()  end)
+    pcall(function() d.Tracer:Remove()    end)
+    pcall(function() d.TeamLabel:Remove() end)
+    pcall(function() d.Highlight:Destroy() end)
+    for _, s in ipairs(d.Skeleton) do pcall(function() s.line:Remove() end) end
+end
+ 
+local function ClearAllESP()
+    for _, d in pairs(ESPObjects) do DestroyESPEntry(d) end
+    ESPObjects = {}
+end
+ 
+local function CreateESPForPlayer(player)
+    if player == LocalPlayer then return end
+    if ESPObjects[player] then return end
+    local col = State.ESP.Color
+    local d   = {}
+ 
+    d.Box              = Drawing.new("Square")
+    d.Box.Visible      = false
+    d.Box.Color        = col
+    d.Box.Thickness    = 1
+    d.Box.Filled       = false
+ 
+    d.Name             = Drawing.new("Text")
+    d.Name.Visible     = false
+    d.Name.Color       = col
+    d.Name.Size        = 14
+    d.Name.Center      = true
+    d.Name.Outline     = true
+ 
+    d.Distance         = Drawing.new("Text")
+    d.Distance.Visible = false
+    d.Distance.Color   = col
+    d.Distance.Size    = 12
+    d.Distance.Center  = true
+    d.Distance.Outline = true
+ 
+    d.Tracer           = Drawing.new("Line")
+    d.Tracer.Visible   = false
+    d.Tracer.Color     = col
+    d.Tracer.Thickness = 1
+ 
+    d.Highlight                     = Instance.new("Highlight")
+    d.Highlight.FillTransparency    = 0.5
+    d.Highlight.OutlineTransparency = 0
+    d.Highlight.FillColor           = col
+    d.Highlight.OutlineColor        = col
+ 
+    d.TeamLabel         = Drawing.new("Text")
+    d.TeamLabel.Visible = false
+    d.TeamLabel.Color   = State.ESP.TeamColor
+    d.TeamLabel.Size    = 13
+    d.TeamLabel.Center  = true
+    d.TeamLabel.Outline = true
+    d.TeamLabel.Text    = "TEAM"
+ 
+    d.Skeleton  = {}
+    d.lastChar  = nil
+    d.lastColor = col
+ 
+    ESPObjects[player] = d
+end
+ 
+local function SetupESP()
+    ClearAllESP()
+    if not State.ESP.Enabled then return end
+    for _, p in ipairs(Players:GetPlayers()) do CreateESPForPlayer(p) end
+end
+ 
+local function UpdateESPPlayer(player, d, selfRoot, rainbowCol)
+    pcall(function() d.Box.Visible       = false end)
+    pcall(function() d.Name.Visible      = false end)
+    pcall(function() d.Distance.Visible  = false end)
+    pcall(function() d.Tracer.Visible    = false end)
+    pcall(function() d.TeamLabel.Visible = false end)
+    for _, s in ipairs(d.Skeleton) do pcall(function() s.line.Visible = false end) end
+ 
+    local char = GetCharacter(player)
+    local root, hum, head
+    if char then
+        root = char:FindFirstChild("HumanoidRootPart")
+        hum  = char:FindFirstChildOfClass("Humanoid")
+        head = char:FindFirstChild("Head")
+    end
+ 
+    local alive = char ~= nil and root ~= nil and hum ~= nil and hum.Health > 0
+ 
+    local isTeam = State.ESP.TeamCheck and IsTeammate(player)
+    if isTeam then
+        if State.ESP.TeamMode == "hide" then
+            pcall(function() if d.Highlight.Parent ~= nil then d.Highlight.Parent = nil end end)
+            return
+        end
+    end
+ 
+    -- NOTE: Highlight is now attached AFTER distance check (see below)
+    if not alive then
+        pcall(function() if d.Highlight.Parent ~= nil then d.Highlight.Parent = nil end end)
+        return
+    end
+    if char ~= d.lastChar then RebuildSkeleton(d, char) end
+ 
+    local col
+    if isTeam then
+        col = State.ESP.TeamColor
+    elseif State.ESP.Rainbow then
+        col = rainbowCol
+    else
+        col = State.ESP.Color
+    end
+ 
+    if col ~= d.lastColor or State.ESP.Rainbow then
+        d.lastColor = col
+        pcall(function()
+            d.Box.Color              = col
+            d.Name.Color             = col
+            d.Distance.Color         = col
+            d.Tracer.Color           = col
+            d.Highlight.FillColor    = col
+            d.Highlight.OutlineColor = col
+            for _, s in ipairs(d.Skeleton) do s.line.Color = col end
+        end)
+    end
+ 
+    local rootPos    = root.Position
+    local headPos    = head and head.Position or (rootPos + Vector3.new(0, 2.5, 0))
+    local feetPos    = rootPos - Vector3.new(0, 3, 0)
+    local headTopPos = headPos + Vector3.new(0, 0.6, 0)
+ 
+    local rootSP,    rootOn = W2S(rootPos)
+    local headSP,    headOn = W2S(headPos)
+    local feetSP,    _      = W2S(feetPos)
+    local headTopSP, _      = W2S(headTopPos)
+ 
+    -- FIX: distance + on-screen guard BEFORE attaching Highlight so out-of-range
+    --      players don't keep a bright outline visible through walls.
+    if not rootOn then
+        pcall(function() if d.Highlight.Parent ~= nil then d.Highlight.Parent = nil end end)
+        return
+    end
+    if State.ESP.MaxDist > 0 and selfRoot then
+        if (selfRoot.Position - rootPos).Magnitude > State.ESP.MaxDist then
+            pcall(function() if d.Highlight.Parent ~= nil then d.Highlight.Parent = nil end end)
+            return
+        end
+    end
+ 
+    -- Highlight (only attached once we know the player is in range / on screen)
+    pcall(function()
+        if State.ESP.Highlight and not isTeam then
+            if d.Highlight.Parent ~= char then d.Highlight.Parent = char end
+        else
+            if d.Highlight.Parent ~= nil then d.Highlight.Parent = nil end
+        end
+    end)
+ 
+    if isTeam and State.ESP.TeamMode == "color" then
+        pcall(function()
+            d.TeamLabel.Color    = State.ESP.TeamColor
+            d.TeamLabel.Position = Vector2.new(rootSP.X, (headOn and headSP.Y or rootSP.Y - 30) - 32)
+            d.TeamLabel.Visible  = true
+        end)
+    end
+ 
+    if State.ESP.Box then
+        pcall(function()
+            local topY = math.min(headTopSP.Y, feetSP.Y)
+            local botY = math.max(headTopSP.Y, feetSP.Y)
+            local sy   = math.max(botY - topY, 4)
+            local sx   = math.max(sy * 0.45, 4)
+            d.Box.Size     = Vector2.new(sx, sy)
+            d.Box.Position = Vector2.new(rootSP.X - sx * 0.5, topY)
+            d.Box.Visible  = true
+        end)
+    end
+ 
+    if State.ESP.Names then
+        pcall(function()
+            d.Name.Text     = player.DisplayName
+            d.Name.Position = Vector2.new(rootSP.X, (headOn and headSP.Y or rootSP.Y - 30) - 18)
+            d.Name.Visible  = true
+        end)
+    end
+ 
+    if State.ESP.Distance then
+        pcall(function()
+            local dist      = selfRoot and math.floor((selfRoot.Position - rootPos).Magnitude) or 0
+            d.Distance.Text     = tostring(dist) .. " studs"
+            d.Distance.Position = Vector2.new(rootSP.X, math.max(feetSP.Y, rootSP.Y) + 4)
+            d.Distance.Visible  = true
+        end)
+    end
+ 
+    if State.ESP.Tracer then
+        pcall(function()
+            d.Tracer.From    = Vector2.new(_vpCenter.X, _vpCenter.Y * 2)
+            d.Tracer.To      = feetSP
+            d.Tracer.Visible = true
+        end)
+    end
+ 
+    if State.ESP.Skeleton then
+        for _, s in ipairs(d.Skeleton) do
+            pcall(function()
+                local p1 = char:FindFirstChild(s.parts[1])
+                local p2 = char:FindFirstChild(s.parts[2])
+                if p1 and p2 then
+                    local s1, on1 = W2S(p1.Position)
+                    local s2, on2 = W2S(p2.Position)
+                    if on1 and on2 then
+                        s.line.From    = s1
+                        s.line.To      = s2
+                        s.line.Visible = true
+                    end
+                end
+            end)
+        end
+    end
+end
+ 
+local function UpdateESP(rainbowCol)
+    local selfRoot = GetRoot(LocalPlayer)
+    if not State.ESP.Enabled then
+        for _, d in pairs(ESPObjects) do ClearESPEntry(d) end
+        return
+    end
+    for player, d in pairs(ESPObjects) do
+        pcall(UpdateESPPlayer, player, d, selfRoot, rainbowCol)
+    end
+end
+ 
+-- ============================================================
+-- // VISUALS
+-- ============================================================
+ 
+local function SetAtmo(a, vals)
+    if not a then return end
+    if vals.Density  ~= nil then pcall(function() a.Density  = vals.Density  end) end
+    if vals.Haze     ~= nil then pcall(function() a.Haze     = vals.Haze     end) end
+    if vals.Glare    ~= nil then pcall(function() a.Glare    = vals.Glare    end) end
+    if vals.FogBlend ~= nil then pcall(function() a.FogBlend = vals.FogBlend end) end
+end
+ 
+local function SetupFullbright()
+    if State.Fullbright then
+        Lighting.Ambient        = Color3.fromRGB(255,255,255)
+        Lighting.OutdoorAmbient = Color3.fromRGB(255,255,255)
+        Lighting.Brightness     = 2
+        Lighting.GlobalShadows  = false
+        SetAtmo(Lighting:FindFirstChildOfClass("Atmosphere"), {Density=0,Haze=0,Glare=0,FogBlend=0})
+        for _, fx in ipairs(Lighting:GetChildren()) do
+            if fx:IsA("PostEffect") then fx.Enabled = false end
+        end
+    else
+        Lighting.Ambient        = LDefault.Ambient
+        Lighting.OutdoorAmbient = LDefault.OutdoorAmbient
+        Lighting.Brightness     = LDefault.Brightness
+        if not State.NoShadows then Lighting.GlobalShadows = LDefault.GlobalShadows end
+        local a = Lighting:FindFirstChildOfClass("Atmosphere")
+        if a and next(AtmoDefault) then SetAtmo(a, AtmoDefault) end
+        for fx, was in pairs(PostFXSaved) do pcall(function() fx.Enabled = was end) end
+        if State.NoFog then
+            SetAtmo(Lighting:FindFirstChildOfClass("Atmosphere"), {Density=0,Haze=0,FogBlend=0})
+        end
+    end
+end
+ 
+local function SetupNoFog()
+    if State.NoFog then
+        Lighting.FogEnd   = 1e9
+        Lighting.FogStart = 1e9
+        SetAtmo(Lighting:FindFirstChildOfClass("Atmosphere"), {Density=0,Haze=0,FogBlend=0})
+    else
+        Lighting.FogEnd   = LDefault.FogEnd
+        Lighting.FogStart = LDefault.FogStart
+        if not State.Fullbright then
+            local a = Lighting:FindFirstChildOfClass("Atmosphere")
+            if a and next(AtmoDefault) then SetAtmo(a, AtmoDefault) end
+        end
+    end
+end
+ 
+local function SetupNoShadows()
+    Lighting.GlobalShadows = not State.NoShadows and LDefault.GlobalShadows or false
+end
+ 
+local function SetupFPSBoost()
+    Drop("FPSParticle")
+    if State.FPSBoost then
+        -- (a) Disable shadows
+        Lighting.GlobalShadows = false
+        -- (b) Lower Roblox render quality to minimum
+        pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
+        -- (c) Cap at Level01 via UserGameSettings too
+        pcall(function()
+            local ugs = game:GetService("UserGameSettings")
+            ugs.SavedQualityLevel = Enum.SavedQualitySetting.QualityLevel1
+        end)
+        -- (d) Disable all PostEffects in Lighting
+        FPSParticleCache = {}
+        for _, fx in ipairs(Lighting:GetDescendants()) do
+            if fx:IsA("PostEffect") then
+                FPSParticleCache[fx] = fx.Enabled
+                pcall(function() fx.Enabled = false end)
+            end
+        end
+        -- (e) Disable particles, fire, smoke, sparkles, trails in workspace
+        for _, v in ipairs(workspace:GetDescendants()) do
+            if v:IsA("ParticleEmitter") or v:IsA("Fire")
+            or v:IsA("Smoke")           or v:IsA("Sparkles")
+            or v:IsA("Trail") then
+                FPSParticleCache[v] = v.Enabled
+                pcall(function() v.Enabled = false end)
+            end
+            -- PBR SurfaceAppearance is very expensive: disable it
+            if v:IsA("SurfaceAppearance") then
+                FPSParticleCache[v] = v.Parent
+                pcall(function() v.Parent = nil end)
+            end
+        end
+        -- (f) Disable Atmosphere (expensive density/scatter calcs)
+        local atmo = Lighting:FindFirstChildOfClass("Atmosphere")
+        if atmo then
+            FPSParticleCache[atmo] = atmo.Parent
+            pcall(function() atmo.Parent = nil end)
+        end
+        -- (g) Disable Sky (cubemap sampling)
+        local sky = Lighting:FindFirstChildOfClass("Sky")
+        if sky then
+            FPSParticleCache[sky] = sky.Parent
+            pcall(function() sky.Parent = nil end)
+        end
+        -- (h) Watch for new instances spawned at runtime
+        Conn("FPSParticle", workspace.DescendantAdded:Connect(function(v)
+            if not State.FPSBoost then return end
+            if v:IsA("ParticleEmitter") or v:IsA("Fire")
+            or v:IsA("Smoke")           or v:IsA("Sparkles")
+            or v:IsA("Trail") then
+                task.defer(function()
+                    if State.FPSBoost and v and v.Parent then
+                        FPSParticleCache[v] = v.Enabled
+                        pcall(function() v.Enabled = false end)
+                    end
+                end)
+            end
+            if v:IsA("SurfaceAppearance") then
+                task.defer(function()
+                    if State.FPSBoost and v and v.Parent then
+                        FPSParticleCache[v] = v.Parent
+                        pcall(function() v.Parent = nil end)
+                    end
+                end)
+            end
+        end))
+    else
+        -- Restore render quality
+        pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Automatic end)
+        pcall(function()
+            local ugs = game:GetService("UserGameSettings")
+            ugs.SavedQualityLevel = Enum.SavedQualitySetting.Automatic
+        end)
+        if not State.NoShadows then
+            Lighting.GlobalShadows = LDefault.GlobalShadows
+        end
+        -- Restore all cached instances
+        for v, was in pairs(FPSParticleCache) do
+            pcall(function()
+                if not v then return end
+                -- SurfaceAppearance and Atmosphere/Sky were re-parented (was = parent)
+                if typeof(was) == "Instance" then
+                    if v and not v.Parent then v.Parent = was end
+                elseif v.Parent then
+                    v.Enabled = was
+                end
+            end)
+        end
+        FPSParticleCache = {}
+    end
+end
+ 
+-- ============================================================
+-- // MOVEMENT
+-- ============================================================
+ 
+local function SetupTPWalk()
+    Drop("TPWalk")
+    if not State.Movement.TPWalk then return end
+    if State.Movement.TPWalkTween then
+        Conn("TPWalk", RunService.Heartbeat:Connect(function(dt)
+            local root = GetRoot(LocalPlayer)
+            local hum  = GetHumanoid(LocalPlayer)
+            if not root or not hum then return end
+            local md = hum.MoveDirection
+            if md.Magnitude < 0.1 then return end
+            local flat = Vector3.new(md.X, 0, md.Z)
+            if flat.Magnitude < 0.01 then flat = md end
+            local tp = TweenService:Create(root,
+                TweenInfo.new(dt, Enum.EasingStyle.Linear),
+                { CFrame = CFrame.new(root.Position + md * State.Movement.TPWalkSpeed * dt,
+                    root.Position + md * State.Movement.TPWalkSpeed * dt + flat.Unit) })
+            tp:Play()
+        end))
+    else
+        Conn("TPWalk", RunService.Heartbeat:Connect(function()
+            local root = GetRoot(LocalPlayer)
+            local hum  = GetHumanoid(LocalPlayer)
+            if not root or not hum then return end
+            local md = hum.MoveDirection
+            if md.Magnitude < 0.1 then return end
+            local flat = Vector3.new(md.X, 0, md.Z)
+            if flat.Magnitude < 0.01 then flat = md end
+            local tp = root.Position + md * State.Movement.TPWalkSpeed * 0.05
+            root.CFrame = CFrame.new(tp, tp + flat.Unit)
+        end))
+    end
+end
+ 
+local function ApplyWalkSpeed()
+    local h = GetHumanoid(LocalPlayer)
+    if not h then return end
+    h.WalkSpeed = State.Movement.WalkSpeed and State.Movement.WalkSpeedValue or Defaults.WalkSpeed
+end
+ 
+local function SetupFly()
+    Drop("Fly")
+    local char = GetCharacter(LocalPlayer)
+    local root = GetRoot(LocalPlayer)
+    local hum  = GetHumanoid(LocalPlayer)
+    if not char or not root or not hum then return end
+    local bv = root:FindFirstChild("FlyBV"); if bv then bv:Destroy() end
+    local bg = root:FindFirstChild("FlyBG"); if bg then bg:Destroy() end
+    if not State.Movement.Fly then hum.PlatformStand = false; return end
+    hum.PlatformStand = true
+    local bv2 = Instance.new("BodyVelocity")
+    bv2.Name     = "FlyBV"; bv2.Velocity  = Vector3.zero
+    bv2.MaxForce = Vector3.new(1e9,1e9,1e9); bv2.Parent = root
+    local bg2 = Instance.new("BodyGyro")
+    bg2.Name     = "FlyBG"; bg2.MaxTorque = Vector3.new(1e9,1e9,1e9)
+    bg2.P        = 1e4; bg2.CFrame = GetCamera().CFrame; bg2.Parent = root
+    Conn("Fly", RunService.Heartbeat:Connect(function()
+        local r = GetRoot(LocalPlayer); if not r then return end
+        local v = r:FindFirstChild("FlyBV"); local g = r:FindFirstChild("FlyBG")
+        if not v or not g then return end
+        local cam = GetCamera(); local d = Vector3.zero
+        if UserInputService:IsKeyDown(Enum.KeyCode.W)           then d = d + cam.CFrame.LookVector  end
+        if UserInputService:IsKeyDown(Enum.KeyCode.S)           then d = d - cam.CFrame.LookVector  end
+        if UserInputService:IsKeyDown(Enum.KeyCode.A)           then d = d - cam.CFrame.RightVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.D)           then d = d + cam.CFrame.RightVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space)       then d = d + Vector3.new(0,1,0)     end
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then d = d - Vector3.new(0,1,0)     end
+        v.Velocity = d.Magnitude > 0 and (d.Unit * State.Movement.FlySpeed) or Vector3.zero
+        g.CFrame   = cam.CFrame
+    end))
+end
+ 
+local SpinBAV = nil   -- BodyAngularVelocity instance for spin
+ 
+local function SetupSpin()
+    Drop("Spin")
+    -- Clean up old BAV
+    if SpinBAV then pcall(function() SpinBAV:Destroy() end); SpinBAV = nil end
+    if not State.Movement.Spin then return end
+    local root = GetRoot(LocalPlayer)
+    if not root then
+        -- Retry once character loads
+        Conn("Spin", RunService.Heartbeat:Connect(function()
+            local r = GetRoot(LocalPlayer)
+            if not r then return end
+            Drop("Spin")
+            if SpinBAV then pcall(function() SpinBAV:Destroy() end); SpinBAV = nil end
+            local bav            = Instance.new("BodyAngularVelocity")
+            bav.AngularVelocity  = Vector3.new(0, math.rad(State.Movement.SpinSpeed) * 60, 0)
+            bav.MaxTorque        = Vector3.new(0, math.huge, 0)
+            bav.P                = math.huge
+            bav.Parent           = r
+            SpinBAV              = bav
+            -- Heartbeat to keep AngularVelocity updated if speed slider changes
+            Conn("Spin", RunService.Heartbeat:Connect(function()
+                if not State.Movement.Spin then return end
+                if SpinBAV and SpinBAV.Parent then
+                    SpinBAV.AngularVelocity = Vector3.new(0, math.rad(State.Movement.SpinSpeed) * 60, 0)
+                end
+            end))
+        end))
+        return
+    end
+    local bav            = Instance.new("BodyAngularVelocity")
+    bav.AngularVelocity  = Vector3.new(0, math.rad(State.Movement.SpinSpeed) * 60, 0)
+    bav.MaxTorque        = Vector3.new(0, math.huge, 0)
+    bav.P                = math.huge
+    bav.Parent           = root
+    SpinBAV              = bav
+    -- Heartbeat to sync speed slider changes live
+    Conn("Spin", RunService.Heartbeat:Connect(function()
+        if not State.Movement.Spin then return end
+        if SpinBAV and SpinBAV.Parent then
+            SpinBAV.AngularVelocity = Vector3.new(0, math.rad(State.Movement.SpinSpeed) * 60, 0)
+        end
+    end))
+end
+ 
+local function SetupInfJump()
+    Drop("InfJump")
+    if not State.Movement.InfJump then return end
+    Conn("InfJump", UserInputService.JumpRequest:Connect(function()
+        local h = GetHumanoid(LocalPlayer)
+        if h then h:ChangeState(Enum.HumanoidStateType.Jumping) end
+    end))
+end
+ 
+local function SetupNoclip()
+    Drop("Noclip")
+    if not State.Movement.Noclip then
+        for part in pairs(NoclipParts) do
+            pcall(function() if part and part.Parent then part.CanCollide = true end end)
+        end
+        NoclipParts = {}
+        return
+    end
+    Conn("Noclip", RunService.Stepped:Connect(function()
+        local char = GetCharacter(LocalPlayer); if not char then return end
+        for _, p in ipairs(char:GetDescendants()) do
+            if p:IsA("BasePart") and p.CanCollide then
+                NoclipParts[p] = true; p.CanCollide = false
+            end
+        end
+    end))
+end
+ 
+-- FIX GodMode: Heartbeat loop continuously restores health so server-side
+-- resets cannot kill the player. BreakJointsOnDeath=false prevents ragdoll.
+local function SetupGodMode()
+    Drop("GodMode"); Drop("GodModeMax"); Drop("GodModeHB")
+    if not State.Movement.GodMode then return end
+    local h = GetHumanoid(LocalPlayer); if not h then return end
+    pcall(function() h.MaxHealth = math.huge end)
+    pcall(function() h.Health    = math.huge end)
+    pcall(function() h.BreakJointsOnDeath = false end)
+    -- React immediately to HealthChanged events
+    Conn("GodMode", h.HealthChanged:Connect(function()
+        if State.Movement.GodMode then
+            pcall(function() h.Health = h.MaxHealth end)
+        end
+    end))
+    -- React if server resets MaxHealth
+    Conn("GodModeMax", h:GetPropertyChangedSignal("MaxHealth"):Connect(function()
+        if State.Movement.GodMode then
+            pcall(function() h.MaxHealth = math.huge; h.Health = math.huge end)
+        end
+    end))
+    -- Heartbeat safety net: catches any health drain the events might miss
+    Conn("GodModeHB", RunService.Heartbeat:Connect(function()
+        if not State.Movement.GodMode then return end
+        local hum = GetHumanoid(LocalPlayer)
+        if hum and hum.Health < hum.MaxHealth then
+            pcall(function() hum.Health = hum.MaxHealth end)
+        end
+    end))
+end
+ 
+local function GetNearestPlayerRoot()
+    local sr = GetRoot(LocalPlayer); if not sr then return nil end
+    local best, bestD = nil, math.huge
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            local r = GetRoot(p)
+            if r then
+                local d = (r.Position - sr.Position).Magnitude
+                if d < bestD then bestD = d; best = r end
+            end
+        end
+    end
+    return best
+end
+ 
+local function GetRandomPlayerRoot()
+    local roots = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            local r = GetRoot(p)
+            if r then table.insert(roots, r) end
+        end
+    end
+    if #roots == 0 then return nil end
+    return roots[math.random(1, #roots)]
+end
+ 
+local function SetupOrbit()
+    Drop("Orbit"); Drop("OrbitClick")
+    OrbitTarget = nil; OrbitAngle = 0; OrbitAutoTimer = 0
+    if not State.Movement.Orbit then return end
+    if State.Movement.OrbitMode == "click" then
+        Conn("OrbitClick", Mouse.Button1Down:Connect(function()
+            if not State.Movement.Orbit then return end
+            if State.Movement.ClickTP or State.Movement.ClickTweenTP then return end
+            local hit = Mouse.Hit; if not hit then return end
+            local best, bestD = nil, math.huge
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= LocalPlayer then
+                    local r = GetRoot(p)
+                    if r then
+                        local d = (r.Position - hit.Position).Magnitude
+                        if d < 8 and d < bestD then bestD = d; best = r end
+                    end
+                end
+            end
+            if best then OrbitTarget = best; OrbitAngle = 0 end
+        end))
+    end
+    Conn("Orbit", RunService.Heartbeat:Connect(function(dt)
+        local root = GetRoot(LocalPlayer); if not root then return end
+        local mode = State.Movement.OrbitMode
+        if mode == "nearest" then
+            OrbitTarget = GetNearestPlayerRoot()
+        elseif mode == "auto" then
+            OrbitAutoTimer = OrbitAutoTimer + dt
+            local targetGone = OrbitTarget == nil or not OrbitTarget.Parent
+            if OrbitAutoTimer >= State.Movement.OrbitCooldown or targetGone then
+                OrbitAutoTimer = 0
+                OrbitTarget    = GetRandomPlayerRoot()
+            end
+        end
+        if not OrbitTarget then return end
+        if not OrbitTarget.Parent then OrbitTarget = nil; return end
+        OrbitAngle   = OrbitAngle + math.rad(State.Movement.OrbitSpeed) * dt * 60
+        local rad    = State.Movement.OrbitRadius
+        local op     = OrbitTarget.Position + Vector3.new(math.cos(OrbitAngle)*rad, 0, math.sin(OrbitAngle)*rad)
+        root.CFrame  = CFrame.new(op, OrbitTarget.Position)
+    end))
+end
+ 
+-- ============================================================
+-- // TRIGGERBOT
+-- ============================================================
+-- Wall-check: gated on State.Triggerbot.WallCheck, uses RaycastVisible directly.
+-- Team-check: gated on State.Triggerbot.TeamCheck, fully independent of aimbot.
+ 
+local function SimulateLMBClick()
+    if mouse1click then
+        pcall(mouse1click)
+    elseif mouse1press then
+        pcall(mouse1press)
+        task.delay(0.05, function() pcall(mouse1release) end)
+    end
+end
+ 
+local function RunTriggerbot(dt)
+    if not State.Triggerbot.Enabled then
+        _tbWasInView = false; _tbSpamTimer = 0
+        return
+    end
+ 
+    local inView = false
+    local radius = State.Triggerbot.Radius
+    local cx, cy = _vpCenter.X, _vpCenter.Y
+ 
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and IsAlive(p)
+        -- FIX: uses its own independent TeamCheck flag
+        and not (State.Triggerbot.TeamCheck and IsTeammate(p)) then
+            local char = GetCharacter(p)
+            local head = char and char:FindFirstChild("Head")
+            if head then
+                local sp, on = W2S(head.Position)
+                if on and (sp - Vector2.new(cx, cy)).Magnitude <= radius then
+                    -- FIX: wall-check gates on Triggerbot.WallCheck, not Aimbot.WallCheck
+                    if not State.Triggerbot.WallCheck or RaycastVisible(head) then
+                        inView = true
+                        break
+                    end
+                end
+            end
+        end
+    end
+ 
+    if State.Triggerbot.Spam then
+        if inView then
+            _tbSpamTimer = _tbSpamTimer + dt
+            if _tbSpamTimer >= State.Triggerbot.Delay then
+                _tbSpamTimer = 0
+                SimulateLMBClick()
+            end
+        else
+            _tbSpamTimer = 0
+        end
+    else
+        if inView and not _tbWasInView then
+            SimulateLMBClick()
+        end
+    end
+ 
+    _tbWasInView = inView
+end
+ 
+-- ============================================================
+-- // HITBOX EXPANDER  (v2.7.2 – ghost-part approach)
+-- ============================================================
+-- Creates a larger GHOST part welded to each target body part.
+--   • CanQuery  = true  → workspace raycasts (used by most FPS games) HIT it
+--   • CanCollide = false → doesn't block player movement
+--   • Original part is NEVER resized → no broken Motor6D joints, no frozen chars
+--   • SmoothPlastic + configurable transparency for the visual indicator
+--   • WeldConstraint keeps it attached through animation frames
+--   • TeamCheck: teammates are skipped entirely
+-- ============================================================
+ 
+local HitboxParts = {}   -- player -> { {ghost=Part, weld=WeldConstraint, hl=Highlight?} }
+ 
+local function MakeGhostPart(origPart)
+    local expand = State.Hitbox.Size
+    local ghost             = Instance.new("Part")
+    ghost.Name              = "PolarisHBX_" .. origPart.Name
+    ghost.Size              = origPart.Size + Vector3.new(expand, expand, expand) * 2
+    ghost.CFrame            = origPart.CFrame
+    ghost.Material          = Enum.Material.SmoothPlastic
+    ghost.Color             = State.Hitbox.Color
+    ghost.Transparency      = 0.65
+    ghost.CanCollide        = false
+    ghost.CanTouch          = false
+    ghost.CanQuery          = true    -- KEY: workspace raycasts register this part
+    ghost.CastShadow        = false
+    ghost.Massless          = true
+    ghost.Anchored          = false
+    ghost.Parent            = origPart.Parent  -- same parent = same model
+ 
+    local wc                = Instance.new("WeldConstraint")
+    wc.Part0                = origPart
+    wc.Part1                = ghost
+    wc.Parent               = ghost
+ 
+    return ghost, wc
+end
+ 
+local function BuildHitboxForPlayer(player)
+    if player == LocalPlayer then return end
+    if State.Hitbox.TeamCheck and IsTeammate(player) then return end
+    if HitboxParts[player] then return end
+    local char = GetCharacter(player)
+    if not char then return end
+ 
+    local entries = {}
+    for partName, enabled in pairs(State.Hitbox.Parts) do
+        if enabled then
+            local orig = char:FindFirstChild(partName)
+            if orig and orig:IsA("BasePart") then
+                local ghost, wc = MakeGhostPart(orig)
+                table.insert(entries, { ghost=ghost, weld=wc, origPart=orig })
+            end
+        end
+    end
+    if #entries == 0 then return end   -- char not loaded yet – retry next tick
+ 
+    -- Optional character-level Highlight for a clear visual overlay
+    local hl = nil
+    if State.Hitbox.Highlight then
+        hl = Instance.new("Highlight")
+        hl.FillColor           = State.Hitbox.Color
+        hl.OutlineColor        = State.Hitbox.Color
+        hl.FillTransparency    = 0.45
+        hl.OutlineTransparency = 0
+        hl.Parent              = char
+    end
+    HitboxParts[player] = { entries = entries, hl = hl }
+end
+ 
+local function RemoveHitboxForPlayer(player)
+    local data = HitboxParts[player]
+    if not data then return end
+    for _, e in ipairs(data.entries) do
+        pcall(function()
+            if e.weld  and e.weld.Parent  then e.weld:Destroy()  end
+            if e.ghost and e.ghost.Parent then e.ghost:Destroy() end
+        end)
+    end
+    if data.hl then pcall(function() data.hl:Destroy() end) end
+    HitboxParts[player] = nil
+end
+ 
+local function ClearAllHitboxes()
+    for player in pairs(HitboxParts) do RemoveHitboxForPlayer(player) end
+    HitboxParts = {}
+end
+ 
+local function RefreshHitboxProperties()
+    local expand = State.Hitbox.Size
+    for player, data in pairs(HitboxParts) do
+        for _, e in ipairs(data.entries) do
+            pcall(function()
+                if not e.ghost or not e.ghost.Parent then return end
+                e.ghost.Size  = e.origPart.Size + Vector3.new(expand,expand,expand)*2
+                e.ghost.Color = State.Hitbox.Color
+            end)
+        end
+        -- Sync highlight
+        local char = GetCharacter(player)
+        if State.Hitbox.Highlight and char then
+            if not data.hl or not data.hl.Parent then
+                local hl = Instance.new("Highlight")
+                hl.FillColor           = State.Hitbox.Color
+                hl.OutlineColor        = State.Hitbox.Color
+                hl.FillTransparency    = 0.45
+                hl.OutlineTransparency = 0
+                hl.Parent              = char
+                data.hl                = hl
+            else
+                data.hl.FillColor    = State.Hitbox.Color
+                data.hl.OutlineColor = State.Hitbox.Color
+            end
+        else
+            if data.hl then
+                pcall(function() data.hl:Destroy() end)
+                data.hl = nil
+            end
+        end
+    end
+end
+ 
+local function SetupHitbox()
+    Drop("HitboxClean")
+    if not State.Hitbox.Enabled then
+        ClearAllHitboxes()
+        return
+    end
+    for _, p in ipairs(Players:GetPlayers()) do BuildHitboxForPlayer(p) end
+    Conn("HitboxClean", RunService.Heartbeat:Connect(function()
+        if not State.Hitbox.Enabled then return end
+        -- Build for players without hitboxes yet
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and not HitboxParts[p] then
+                BuildHitboxForPlayer(p)
+            end
+        end
+        -- Detect stale ghost parts (respawn destroyed char) and rebuild
+        for player, data in pairs(HitboxParts) do
+            local char = GetCharacter(player)
+            if not char then
+                RemoveHitboxForPlayer(player)
+            else
+                local stale = false
+                for _, e in ipairs(data.entries) do
+                    if not e.ghost or not e.ghost.Parent then stale=true; break end
+                end
+                if stale then
+                    RemoveHitboxForPlayer(player)
+                    BuildHitboxForPlayer(player)
+                end
+            end
+        end
+        RefreshHitboxProperties()
+    end))
+end
+ 
+local function SetupAntiFling()
+    Drop("AntiFling")
+    if not State.AntiFling then return end
+    Conn("AntiFling", RunService.Heartbeat:Connect(function()
+        local r = GetRoot(LocalPlayer)
+        if r and r.AssemblyLinearVelocity.Magnitude > 100 then
+            r.AssemblyLinearVelocity = Vector3.zero
+        end
+    end))
+end
+ 
+-- FIX: also reset TweenTPActive so click-TP isn't permanently locked after
+-- the character dies mid-tween (Tween.Completed may never fire if root destroyed).
+local function OnCharacterAdded()
+    task.wait(0.5)
+    TweenTPActive = false   -- FIX: unstick tween flag on respawn
+    -- Spin BAV was attached to old (now destroyed) root; re-attach
+    if SpinBAV then pcall(function() SpinBAV:Destroy() end); SpinBAV = nil end
+    RefreshDefaults()
+    if State.Movement.Fly       then SetupFly()       end
+    if State.Movement.Spin      then SetupSpin()      end
+    if State.Movement.WalkSpeed then ApplyWalkSpeed()  end
+    if State.Movement.JumpPower then
+        local h = GetHumanoid(LocalPlayer)
+        if h then h.JumpPower = State.Movement.JumpPowerValue end
+    end
+    if State.Movement.GodMode   then SetupGodMode()   end
+    if State.Movement.InfJump   then SetupInfJump()   end
+    if State.Movement.Noclip    then SetupNoclip()     end
+end
+ 
+-- ============================================================
+-- // MUSIC
+-- ============================================================
+ 
+local MusicSound      = Instance.new("Sound")
+MusicSound.Name       = "PolarisMusic"
+MusicSound.Parent     = SoundService
+ 
+local function ApplyMusicSettings()
+    MusicSound.Volume = State.Music.Volume
+    pcall(function() MusicSound.PlaybackSpeed = State.Music.Pitch end)
+    MusicSound.Looped = State.Music.Looped
+end
+ 
+local function PlayMusic()
+    if State.Music.ID == "" then return end
+    MusicSound.SoundId = "rbxassetid://" .. State.Music.ID
+    ApplyMusicSettings()
+    MusicSound:Play()
+    State.Music.Playing = true
+end
+ 
+local function StopMusic()
+    MusicSound:Stop()
+    State.Music.Playing = false
+end
+ 
+-- ============================================================
+-- // CONFIG SYSTEM
+-- ============================================================
+ 
+local CFG_FOLDER   = "polaris_configs"
+local CFG_EXT      = ".json"
+local CFG_AUTOLOAD = "polaris_autoload.txt"
+ 
+local function C3S(c) return { c.R, c.G, c.B } end
+local function SC3(t)
+    if type(t) ~= "table" or not t[1] then return nil end
+    return Color3.new(t[1], t[2], t[3])
+end
+ 
+local function SerializeState()
+    local hbParts = {}
+    for k, v in pairs(State.Hitbox.Parts) do hbParts[k] = v end
+    local customPresets = {}
+    for _, p in ipairs(State.Music.CustomPresets) do
+        table.insert(customPresets, { name = p.name, id = p.id })
+    end
+    return {
+        Aimbot = {
+            Enabled            = State.Aimbot.Enabled,
+            KeepLocked         = State.Aimbot.KeepLocked,
+            Smoothness         = State.Aimbot.Smoothness,
+            FOV                = State.Aimbot.FOV,
+            Color              = C3S(State.Aimbot.Color),
+            LockKey            = State.Aimbot.LockKey,
+            WallCheck          = State.Aimbot.WallCheck,
+            Prediction         = State.Aimbot.Prediction,
+            PredictionStrength = State.Aimbot.PredictionStrength,
+            TeamCheck          = State.Aimbot.TeamCheck,
+            RainbowFOV         = State.Aimbot.RainbowFOV,
+            RainbowSpeed       = State.Aimbot.RainbowSpeed,
+            TargetPart         = State.Aimbot.TargetPart,
+        },
+        ESP = {
+            Enabled      = State.ESP.Enabled,
+            Box          = State.ESP.Box,
+            Skeleton     = State.ESP.Skeleton,
+            Names        = State.ESP.Names,
+            Distance     = State.ESP.Distance,
+            Highlight    = State.ESP.Highlight,
+            Tracer       = State.ESP.Tracer,
+            Color        = C3S(State.ESP.Color),
+            Rainbow      = State.ESP.Rainbow,
+            RainbowSpeed = State.ESP.RainbowSpeed,
+            TeamCheck    = State.ESP.TeamCheck,
+            TeamMode     = State.ESP.TeamMode,
+            TeamColor    = C3S(State.ESP.TeamColor),
+            MaxDist      = State.ESP.MaxDist,
+        },
+        Movement = {
+            -- Walk
+            WalkSpeed         = State.Movement.WalkSpeed,
+            WalkSpeedValue    = State.Movement.WalkSpeedValue,
+            -- Jump
+            JumpPower         = State.Movement.JumpPower,
+            JumpPowerValue    = State.Movement.JumpPowerValue,
+            InfJump           = State.Movement.InfJump,
+            -- Fly
+            Fly               = State.Movement.Fly,
+            FlySpeed          = State.Movement.FlySpeed,
+            -- Spin
+            Spin              = State.Movement.Spin,
+            SpinSpeed         = State.Movement.SpinSpeed,
+            -- Teleport walk
+            TPWalk            = State.Movement.TPWalk,
+            TPWalkTween       = State.Movement.TPWalkTween,
+            TPWalkSpeed       = State.Movement.TPWalkSpeed,
+            -- Click TP
+            ClickTP           = State.Movement.ClickTP,
+            ClickTweenTP      = State.Movement.ClickTweenTP,
+            ClickTweenTPSpeed = State.Movement.ClickTweenTPSpeed,
+            -- Utility
+            Noclip            = State.Movement.Noclip,
+            GodMode           = State.Movement.GodMode,
+            -- Orbit
+            Orbit             = State.Movement.Orbit,
+            OrbitSpeed        = State.Movement.OrbitSpeed,
+            OrbitRadius       = State.Movement.OrbitRadius,
+            OrbitMode         = State.Movement.OrbitMode,
+            OrbitCooldown     = State.Movement.OrbitCooldown,
+        },
+        Triggerbot = {
+            Enabled   = State.Triggerbot.Enabled,
+            Spam      = State.Triggerbot.Spam,
+            WallCheck = State.Triggerbot.WallCheck,
+            TeamCheck = State.Triggerbot.TeamCheck,
+            Radius    = State.Triggerbot.Radius,
+            Delay     = State.Triggerbot.Delay,
+        },
+        Hitbox = {
+            Enabled   = State.Hitbox.Enabled,
+            Size      = State.Hitbox.Size,
+            Color     = C3S(State.Hitbox.Color),
+            Highlight = State.Hitbox.Highlight,
+            TeamCheck = State.Hitbox.TeamCheck,
+            Parts     = hbParts,
+        },
+        Music = {
+            ID            = State.Music.ID,
+            Volume        = State.Music.Volume,
+            Pitch         = State.Music.Pitch,
+            Looped        = State.Music.Looped,
+            CustomPresets = customPresets,
+        },
+        Fullbright = State.Fullbright,
+        NoFog      = State.NoFog,
+        NoShadows  = State.NoShadows,
+        FPSBoost   = State.FPSBoost,
+        AntiFling  = State.AntiFling,
+        CameraFOV  = State.CameraFOV,
+    }
+end
+ 
+local function ApplyDeserializedState(d)
+    if not d then return end
+    if d.Aimbot then
+        local a = d.Aimbot
+        if a.Enabled            ~= nil then State.Aimbot.Enabled            = a.Enabled            end
+        if a.KeepLocked         ~= nil then State.Aimbot.KeepLocked         = a.KeepLocked         end
+        if a.Smoothness         ~= nil then State.Aimbot.Smoothness         = a.Smoothness         end
+        if a.FOV                ~= nil then State.Aimbot.FOV                = a.FOV                end
+        if a.Color              ~= nil then State.Aimbot.Color              = SC3(a.Color) or State.Aimbot.Color end
+        if a.LockKey            ~= nil then State.Aimbot.LockKey            = a.LockKey            end
+        if a.WallCheck          ~= nil then State.Aimbot.WallCheck          = a.WallCheck          end
+        if a.Prediction         ~= nil then State.Aimbot.Prediction         = a.Prediction         end
+        if a.PredictionStrength ~= nil then State.Aimbot.PredictionStrength = a.PredictionStrength end
+        if a.TeamCheck          ~= nil then State.Aimbot.TeamCheck          = a.TeamCheck          end
+        if a.RainbowFOV         ~= nil then State.Aimbot.RainbowFOV         = a.RainbowFOV         end
+        if a.RainbowSpeed       ~= nil then State.Aimbot.RainbowSpeed       = a.RainbowSpeed       end
+        if a.TargetPart         ~= nil then State.Aimbot.TargetPart         = a.TargetPart         end
+        SetupAimbot()
+    end
+    if d.ESP then
+        local e = d.ESP
+        if e.Enabled      ~= nil then State.ESP.Enabled      = e.Enabled      end
+        if e.Box          ~= nil then State.ESP.Box          = e.Box          end
+        if e.Skeleton     ~= nil then State.ESP.Skeleton     = e.Skeleton     end
+        if e.Names        ~= nil then State.ESP.Names        = e.Names        end
+        if e.Distance     ~= nil then State.ESP.Distance     = e.Distance     end
+        if e.Highlight    ~= nil then State.ESP.Highlight    = e.Highlight    end
+        if e.Tracer       ~= nil then State.ESP.Tracer       = e.Tracer       end
+        if e.Color        ~= nil then State.ESP.Color        = SC3(e.Color) or State.ESP.Color end
+        if e.Rainbow      ~= nil then State.ESP.Rainbow      = e.Rainbow      end
+        if e.RainbowSpeed ~= nil then State.ESP.RainbowSpeed = e.RainbowSpeed end
+        if e.TeamCheck    ~= nil then State.ESP.TeamCheck    = e.TeamCheck    end
+        if e.TeamMode     ~= nil then State.ESP.TeamMode     = e.TeamMode     end
+        if e.TeamColor    ~= nil then State.ESP.TeamColor    = SC3(e.TeamColor) or State.ESP.TeamColor end
+        if e.MaxDist      ~= nil then State.ESP.MaxDist      = e.MaxDist      end
+        SetupESP()
+    end
+    if d.Movement then
+        local m = d.Movement
+        -- Walk
+        if m.WalkSpeed      ~= nil then State.Movement.WalkSpeed      = m.WalkSpeed      end
+        if m.WalkSpeedValue ~= nil then State.Movement.WalkSpeedValue = m.WalkSpeedValue end
+        -- Jump
+        if m.JumpPower      ~= nil then State.Movement.JumpPower      = m.JumpPower      end
+        if m.JumpPowerValue ~= nil then State.Movement.JumpPowerValue = m.JumpPowerValue end
+        if m.InfJump        ~= nil then State.Movement.InfJump = m.InfJump; SetupInfJump() end
+        -- Fly
+        if m.FlySpeed       ~= nil then State.Movement.FlySpeed   = m.FlySpeed   end
+        if m.Fly            ~= nil then State.Movement.Fly = m.Fly; SetupFly()   end
+        -- Spin
+        if m.SpinSpeed      ~= nil then State.Movement.SpinSpeed  = m.SpinSpeed  end
+        if m.Spin           ~= nil then State.Movement.Spin = m.Spin; SetupSpin() end
+        -- Teleport walk
+        if m.TPWalkSpeed    ~= nil then State.Movement.TPWalkSpeed = m.TPWalkSpeed end
+        if m.TPWalkTween    ~= nil then State.Movement.TPWalkTween = m.TPWalkTween end
+        if m.TPWalk         ~= nil then State.Movement.TPWalk = m.TPWalk; SetupTPWalk() end
+        -- Click TP
+        if m.ClickTweenTPSpeed ~= nil then State.Movement.ClickTweenTPSpeed = m.ClickTweenTPSpeed end
+        if m.ClickTP        ~= nil then State.Movement.ClickTP      = m.ClickTP      end
+        if m.ClickTweenTP   ~= nil then State.Movement.ClickTweenTP = m.ClickTweenTP end
+        -- Utility
+        if m.Noclip  ~= nil then State.Movement.Noclip  = m.Noclip;  SetupNoclip()  end
+        if m.GodMode ~= nil then State.Movement.GodMode = m.GodMode; SetupGodMode() end
+        -- Orbit
+        if m.OrbitSpeed    ~= nil then State.Movement.OrbitSpeed    = m.OrbitSpeed    end
+        if m.OrbitRadius   ~= nil then State.Movement.OrbitRadius   = m.OrbitRadius   end
+        if m.OrbitMode     ~= nil then State.Movement.OrbitMode     = m.OrbitMode     end
+        if m.OrbitCooldown ~= nil then State.Movement.OrbitCooldown = m.OrbitCooldown end
+        if m.Orbit         ~= nil then State.Movement.Orbit = m.Orbit; SetupOrbit()  end
+        -- Apply live values
+        ApplyWalkSpeed()
+        local _h2 = GetHumanoid(LocalPlayer)
+        if _h2 and State.Movement.JumpPower then _h2.JumpPower = State.Movement.JumpPowerValue end
+    end
+    if d.Triggerbot then
+        local t = d.Triggerbot
+        if t.Enabled   ~= nil then State.Triggerbot.Enabled   = t.Enabled   end
+        if t.Spam      ~= nil then State.Triggerbot.Spam      = t.Spam      end
+        if t.WallCheck ~= nil then State.Triggerbot.WallCheck = t.WallCheck end
+        if t.TeamCheck ~= nil then State.Triggerbot.TeamCheck = t.TeamCheck end
+        if t.Radius    ~= nil then State.Triggerbot.Radius    = t.Radius    end
+        if t.Delay     ~= nil then State.Triggerbot.Delay     = t.Delay     end
+    end
+    if d.Hitbox then
+        local h = d.Hitbox
+        if h.Enabled   ~= nil then State.Hitbox.Enabled   = h.Enabled   end
+        if h.Size      ~= nil then State.Hitbox.Size      = h.Size      end
+        if h.Color     ~= nil then State.Hitbox.Color     = SC3(h.Color) or State.Hitbox.Color end
+        if h.Highlight ~= nil then State.Hitbox.Highlight = h.Highlight end
+        if h.TeamCheck ~= nil then State.Hitbox.TeamCheck = h.TeamCheck end
+        if type(h.Parts) == "table" then
+            for k, v in pairs(h.Parts) do
+                if State.Hitbox.Parts[k] ~= nil then State.Hitbox.Parts[k] = v end
+            end
+        end
+        if State.Hitbox.Enabled then ClearAllHitboxes(); SetupHitbox() end
+    end
+    if d.Music then
+        local mu = d.Music
+        if mu.ID     ~= nil then State.Music.ID     = mu.ID     end
+        if mu.Volume ~= nil then State.Music.Volume = mu.Volume; MusicSound.Volume = mu.Volume end
+        if mu.Pitch  ~= nil then
+            State.Music.Pitch = mu.Pitch
+            pcall(function() MusicSound.PlaybackSpeed = mu.Pitch end)
+        end
+        if mu.Looped ~= nil then State.Music.Looped = mu.Looped; MusicSound.Looped = mu.Looped end
+        if type(mu.CustomPresets) == "table" then
+            State.Music.CustomPresets = {}
+            for _, p in ipairs(mu.CustomPresets) do
+                if type(p.name) == "string" and type(p.id) == "string" then
+                    table.insert(State.Music.CustomPresets, { name=p.name, id=p.id })
+                end
+            end
+        end
+    end
+    if d.Fullbright ~= nil then State.Fullbright = d.Fullbright; SetupFullbright() end
+    if d.NoFog      ~= nil then State.NoFog      = d.NoFog;      SetupNoFog()      end
+    if d.NoShadows  ~= nil then State.NoShadows  = d.NoShadows;  SetupNoShadows()  end
+    if d.FPSBoost   ~= nil then State.FPSBoost   = d.FPSBoost;   SetupFPSBoost()   end
+    if d.AntiFling  ~= nil then State.AntiFling  = d.AntiFling;  SetupAntiFling()  end
+    if d.CameraFOV  ~= nil then
+        State.CameraFOV         = d.CameraFOV
+        GetCamera().FieldOfView = d.CameraFOV
+    end
+    -- Sync all GUI widgets to the newly loaded state values
+    task.defer(SyncGUI)
+end
+ 
+-- File I/O helpers (all pcall-guarded)
+local function CFGEnsureFolder()
+    pcall(function()
+        if isfolder and not isfolder(CFG_FOLDER) then
+            if makefolder then makefolder(CFG_FOLDER) end
+        end
+    end)
+end
+ 
+-- FIX: filters to only .json files so stray files don't appear in the list
+local function CFGList()
+    local names = {}
+    pcall(function()
+        if not (isfolder and listfiles) then return end
+        if not isfolder(CFG_FOLDER) then return end
+        for _, f in ipairs(listfiles(CFG_FOLDER)) do
+            -- Only process files ending in .json
+            if not f:match("%.json$") then continue end
+            local name = f:match("[/\\]?([^/\\]+)$")
+            if name then
+                name = name:gsub("%.json$", "")
+                if name ~= "" then table.insert(names, name) end
+            end
+        end
+    end)
+    return names
+end
+ 
+local function CFGSave(name)
+    if not writefile then return false, "writefile not available" end
+    CFGEnsureFolder()
+    local ok, data = pcall(SerializeState)
+    if not ok then return false, "serialization failed" end
+    local ok2, json = pcall(HttpService.JSONEncode, HttpService, data)
+    if not ok2 then return false, "JSON encode failed" end
+    local ok3 = pcall(writefile, CFG_FOLDER .. "/" .. name .. CFG_EXT, json)
+    if not ok3 then return false, "write failed" end
+    pcall(writefile, CFG_AUTOLOAD, name)
+    return true
+end
+ 
+local function CFGLoad(name)
+    if not readfile then return false, "readfile not available" end
+    local ok, json = pcall(readfile, CFG_FOLDER .. "/" .. name .. CFG_EXT)
+    if not ok or not json or json == "" then return false, "file not found" end
+    local ok2, data = pcall(HttpService.JSONDecode, HttpService, json)
+    if not ok2 or not data then return false, "JSON decode failed" end
+    pcall(ApplyDeserializedState, data)
+    pcall(writefile, CFG_AUTOLOAD, name)
+    return true
+end
+ 
+local function CFGDelete(name)
+    pcall(function()
+        if delfile then delfile(CFG_FOLDER .. "/" .. name .. CFG_EXT) end
+    end)
+    -- If the deleted config was the auto-load target, clear the pointer
+    pcall(function()
+        if readfile then
+            local ok, current = pcall(readfile, CFG_AUTOLOAD)
+            if ok and current == name and writefile then
+                writefile(CFG_AUTOLOAD, "")
+            end
+        end
+    end)
+end
+ 
+-- Forward-declaration: statusLabel is set inside the Configs tab block below.
+-- CFGAutoLoad uses it via upvalue after the GUI is built.
+local _cfgStatusLabel = nil
+ 
+-- FIX CRASH: PolarisNotify is defined later in the GUI section.
+-- Forward-declare it here so CFGAutoLoad (which runs via task.delay) can call
+-- it. Without this, Lua lexical scoping resolves it as a global nil and errors.
+local PolarisNotify   -- assigned below, after GUI helpers are set up
+ 
+local function CFGAutoLoad()
+    -- DISABLED: autoload on startup is off by design (v2.7).
+    -- Users must manually press "Load" in the Configs tab.
+    -- This function is kept as a no-op so existing call sites don't error.
+end
+ 
+-- ============================================================
+-- // GUI HELPERS
+-- ============================================================
+ 
+local function New(class, props, children)
+    local ok, inst = pcall(Instance.new, class)
+    if not ok then return nil end
+    if props then
+        for k, v in pairs(props) do pcall(function() inst[k] = v end) end
+    end
+    if children then
+        for _, c in ipairs(children) do if c then c.Parent = inst end end
+    end
+    return inst
+end
+ 
+local function Tween(inst, info, props)
+    if inst and inst.Parent then TweenService:Create(inst, info, props):Play() end
+end
+ 
+local T_FAST = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local T_MED  = TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+ 
+-- ============================================================
+-- // COLORS
+-- ============================================================
+ 
+local C = {
+    BG         = Color3.fromRGB(13,  13,  18),
+    Sidebar    = Color3.fromRGB(17,  17,  24),
+    Panel      = Color3.fromRGB(20,  20,  28),
+    Element    = Color3.fromRGB(26,  26,  36),
+    ElemHov    = Color3.fromRGB(32,  32,  44),
+    Accent     = Color3.fromRGB(99,  130, 255),
+    AccentDim  = Color3.fromRGB(60,  80,  180),
+    AccentGlow = Color3.fromRGB(120, 150, 255),
+    On         = Color3.fromRGB(99,  255, 160),
+    Off        = Color3.fromRGB(60,  60,  80),
+    Text       = Color3.fromRGB(220, 220, 235),
+    TextDim    = Color3.fromRGB(120, 120, 145),
+    TextMuted  = Color3.fromRGB(70,  70,  90),
+    Border     = Color3.fromRGB(35,  35,  50),
+    White      = Color3.fromRGB(255, 255, 255),
+    SliderFill = Color3.fromRGB(99,  130, 255),
+    SliderBG   = Color3.fromRGB(30,  30,  42),
+    Red        = Color3.fromRGB(220, 60,  60),
+}
+ 
+-- ============================================================
+-- // SCREENGUI
+-- ============================================================
+ 
+local guiParent
+local _cgOk, _cg = pcall(function() return game:GetService("CoreGui") end)
+if _cgOk and _cg then guiParent = _cg
+else guiParent = LocalPlayer:WaitForChild("PlayerGui") end
+ 
+local ScreenGui = New("ScreenGui", {
+    Name           = "PolarisGUI",
+    ResetOnSpawn   = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    IgnoreGuiInset = true,
+    Parent         = guiParent,
+})
+ 
+local WatermarkGui = New("ScreenGui", {
+    Name           = "PolarisWatermark",
+    ResetOnSpawn   = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    IgnoreGuiInset = true,
+    Parent         = guiParent,
+})
+ 
+-- ============================================================
+-- // WATERMARK
+-- ============================================================
+ 
+local Watermark = New("Frame", {
+    Size             = UDim2.fromOffset(240, 30),
+    Position         = UDim2.new(1, -248, 0, 8),
+    BackgroundColor3 = C.Panel,
+    BorderSizePixel  = 0,
+    ZIndex           = 60,
+    Parent           = WatermarkGui,
+}, {
+    New("UICorner", { CornerRadius = UDim.new(0, 7) }),
+    New("UIStroke", { Color = C.Border, Thickness = 1 }),
+})
+ 
+New("Frame", {
+    Size             = UDim2.fromOffset(3, 18),
+    Position         = UDim2.new(0, 0, 0.5, -9),
+    BackgroundColor3 = C.Accent,
+    BorderSizePixel  = 0,
+    ZIndex           = 61,
+    Parent           = Watermark,
+}, { New("UICorner", { CornerRadius = UDim.new(1, 0) }) })
+ 
+local WatermarkLabel = New("TextLabel", {
+    Size                   = UDim2.new(1, -12, 1, 0),
+    Position               = UDim2.new(0, 10, 0, 0),
+    BackgroundTransparency = 1,
+    Text                   = "polaris.gov",
+    Font                   = Enum.Font.GothamBold,
+    TextSize               = 11,
+    TextColor3             = C.Accent,
+    TextXAlignment         = Enum.TextXAlignment.Left,
+    ZIndex                 = 62,
+    Parent                 = Watermark,
+})
+ 
+local _fpsCount  = 0
+local _fpsAccum  = 0
+local _fpsCached = 0
+local _wmAccum   = 0
+ 
+-- ============================================================
+-- // DISCORD LINK  (bottom-right persistent label)
+-- ============================================================
+ 
+local DISCORD_LINK = "https://discord.gg/2azAG826Tm"
+ 
+New("Frame", {
+    Name             = "PolarisDiscord",
+    Size             = UDim2.fromOffset(220, 24),
+    Position         = UDim2.new(1, -228, 1, -32),
+    BackgroundColor3 = C.Panel,
+    BorderSizePixel  = 0,
+    ZIndex           = 60,
+    Parent           = WatermarkGui,
+}, {
+    New("UICorner", { CornerRadius = UDim.new(0, 7) }),
+    New("UIStroke", { Color = C.Border, Thickness = 1 }),
+    New("Frame", {
+        Size=UDim2.fromOffset(3,14), Position=UDim2.new(0,0,0.5,-7),
+        BackgroundColor3=Color3.fromRGB(88,101,242),
+        BorderSizePixel=0, ZIndex=61,
+    }, { New("UICorner",{CornerRadius=UDim.new(1,0)}) }),
+    New("TextLabel", {
+        Size=UDim2.new(1,-12,1,0), Position=UDim2.new(0,10,0,0),
+        BackgroundTransparency=1,
+        Text="discord.gg/2azAG826Tm",
+        Font=Enum.Font.Gotham, TextSize=10,
+        TextColor3=Color3.fromRGB(150,160,255),
+        TextXAlignment=Enum.TextXAlignment.Left,
+        ZIndex=62,
+    }),
+})
+ 
+-- ============================================================
+-- // MAIN WINDOW
+-- ============================================================
+ 
+local WIN_W     = 580
+local WIN_H     = 400
+local SIDEBAR_W = 140
+ 
+local MainFrame = New("Frame", {
+    Name             = "MainFrame",
+    Size             = UDim2.fromOffset(WIN_W, WIN_H),
+    Position         = UDim2.new(0.5, -WIN_W/2, 0.5, -WIN_H/2),
+    BackgroundColor3 = C.BG,
+    BorderSizePixel  = 0,
+    ClipsDescendants = false,
+    Parent           = ScreenGui,
+}, {
+    New("UICorner", { CornerRadius = UDim.new(0, 10) }),
+    New("UIStroke", { Color = C.Border, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }),
+})
+ 
+New("ImageLabel", {
+    AnchorPoint            = Vector2.new(0.5, 0.5),
+    Size                   = UDim2.new(1, 40, 1, 40),
+    Position               = UDim2.new(0.5, 0, 0.5, 8),
+    BackgroundTransparency = 1,
+    Image                  = "rbxassetid://6014261993",
+    ImageColor3            = Color3.fromRGB(0,0,0),
+    ImageTransparency      = 0.55,
+    ScaleType              = Enum.ScaleType.Slice,
+    SliceCenter            = Rect.new(49,49,450,450),
+    ZIndex                 = 0,
+    Parent                 = MainFrame,
+})
+ 
+local Sidebar = New("Frame", {
+    Size             = UDim2.new(0, SIDEBAR_W, 1, 0),
+    BackgroundColor3 = C.Sidebar,
+    BorderSizePixel  = 0,
+    ClipsDescendants = true,
+    ZIndex           = 2,
+    Parent           = MainFrame,
+}, { New("UICorner", { CornerRadius = UDim.new(0, 10) }) })
+ 
+New("Frame", {
+    Size=UDim2.new(0,1,1,0), Position=UDim2.new(1,-1,0,0),
+    BackgroundColor3=C.Border, BorderSizePixel=0, ZIndex=3, Parent=Sidebar,
+})
+ 
+local _logo = New("Frame", { Size=UDim2.new(1,0,0,54), BackgroundTransparency=1, ZIndex=3, Parent=Sidebar })
+New("TextLabel", {
+    Size=UDim2.new(1,-16,0,18), Position=UDim2.new(0,8,0,10),
+    BackgroundTransparency=1, Text="polaris.gov", Font=Enum.Font.GothamBold,
+    TextSize=14, TextColor3=C.Accent, TextXAlignment=Enum.TextXAlignment.Left, ZIndex=4, Parent=_logo,
+})
+New("TextLabel", {
+    Size=UDim2.new(1,-16,0,12), Position=UDim2.new(0,8,0,30),
+    BackgroundTransparency=1, Text="v2.7.2 universal", Font=Enum.Font.Gotham,
+    TextSize=10, TextColor3=C.TextMuted, TextXAlignment=Enum.TextXAlignment.Left, ZIndex=4, Parent=_logo,
+})
+ 
+local TabButtonList = New("ScrollingFrame", {
+    Size=UDim2.new(1,0,1,-60), Position=UDim2.new(0,0,0,56),
+    BackgroundTransparency=1, ScrollBarThickness=0,
+    CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y,
+    ZIndex=3, Parent=Sidebar,
+}, {
+    New("UIListLayout", { Padding=UDim.new(0,3), FillDirection=Enum.FillDirection.Vertical, SortOrder=Enum.SortOrder.LayoutOrder }),
+    New("UIPadding", { PaddingLeft=UDim.new(0,8), PaddingRight=UDim.new(0,8), PaddingTop=UDim.new(0,4) }),
+})
+ 
+local TitleBar = New("Frame", {
+    Size=UDim2.new(1,-SIDEBAR_W,0,44), Position=UDim2.new(0,SIDEBAR_W,0,0),
+    BackgroundTransparency=1, ZIndex=3, Parent=MainFrame,
+})
+local ActiveTabLabel = New("TextLabel", {
+    Size=UDim2.new(1,-60,1,0), Position=UDim2.new(0,16,0,0),
+    BackgroundTransparency=1, Text="", Font=Enum.Font.GothamBold,
+    TextSize=14, TextColor3=C.Text, TextXAlignment=Enum.TextXAlignment.Left,
+    ZIndex=4, Parent=TitleBar,
+})
+local CloseBtn = New("TextButton", {
+    Size=UDim2.fromOffset(24,24), Position=UDim2.new(1,-34,0.5,-12),
+    BackgroundColor3=C.Red, Text="", BorderSizePixel=0, ZIndex=4, Parent=TitleBar,
+}, {
+    New("UICorner", { CornerRadius=UDim.new(1,0) }),
+    New("TextLabel", { Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text="×",
+        Font=Enum.Font.GothamBold, TextSize=16, TextColor3=C.White, ZIndex=5 }),
+})
+CloseBtn.MouseButton1Click:Connect(function() MainFrame.Visible = false end)
+ 
+New("Frame", {
+    Size=UDim2.new(1,-SIDEBAR_W,0,1), Position=UDim2.new(0,SIDEBAR_W,0,44),
+    BackgroundColor3=C.Border, BorderSizePixel=0, ZIndex=3, Parent=MainFrame,
+})
+ 
+local ContentPanel = New("Frame", {
+    Size=UDim2.new(1,-SIDEBAR_W,1,-44), Position=UDim2.new(0,SIDEBAR_W,0,44),
+    BackgroundTransparency=1, ClipsDescendants=true, ZIndex=2, Parent=MainFrame,
+})
+ 
+local GuiVisible = true
+UserInputService.InputBegan:Connect(function(inp, gpe)
+    if gpe then return end
+    if inp.KeyCode == Enum.KeyCode.RightAlt then
+        GuiVisible = not GuiVisible
+        MainFrame.Visible = GuiVisible
+    end
+end)
+ 
+-- Drag
+do
+    local dragging, dragStart, startPos
+    MainFrame.InputBegan:Connect(function(inp)
+        if inp.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+        if inp.Position.Y - MainFrame.AbsolutePosition.Y <= 44 then
+            dragging=true; dragStart=inp.Position; startPos=MainFrame.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(inp)
+        if not dragging or inp.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+        local d = inp.Position - dragStart
+        MainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset+d.X, startPos.Y.Scale, startPos.Y.Offset+d.Y)
+    end)
+    UserInputService.InputEnded:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 then dragging=false end
+    end)
+end
+ 
+-- ============================================================
+-- // TAB SYSTEM
+-- ============================================================
+ 
+local Tabs      = {}
+local ActiveTab = nil
+local TabOrder  = 0
+ 
+local function SwitchTab(name)
+    if ActiveTab == name then return end
+    ActiveTab = name
+    ActiveTabLabel.Text = name
+    for n, t in pairs(Tabs) do
+        local on = (n == name)
+        Tween(t.Btn, T_FAST, {
+            BackgroundColor3       = on and C.AccentDim or Color3.fromRGB(0,0,0),
+            BackgroundTransparency = on and 0 or 1,
+        })
+        Tween(t.BtnLabel, T_FAST, { TextColor3 = on and C.AccentGlow or C.TextDim })
+        t.Scroll.Visible = on
+    end
+end
+ 
+local OpenPopups = {}
+ 
+local function CloseAllPopups()
+    for _, ref in ipairs(OpenPopups) do
+        if ref.frame and ref.frame.Parent then
+            ref.frame.Visible = false; ref.open = false
+        end
+    end
+end
+ 
+local function PointInAnyPopup(px, py)
+    for _, ref in ipairs(OpenPopups) do
+        if ref.open and ref.frame and ref.frame.Visible then
+            local ap = ref.frame.AbsolutePosition
+            local as = ref.frame.AbsoluteSize
+            if px >= ap.X and px <= ap.X+as.X and py >= ap.Y and py <= ap.Y+as.Y then
+                return true
+            end
+        end
+    end
+    return false
+end
+ 
+local function CreateTab(name)
+    TabOrder = TabOrder + 1
+    local btn = New("TextButton", {
+        Size=UDim2.new(1,0,0,30), BackgroundColor3=Color3.fromRGB(0,0,0),
+        BackgroundTransparency=1, Text="", BorderSizePixel=0,
+        LayoutOrder=TabOrder, ZIndex=4, Parent=TabButtonList,
+    }, { New("UICorner", { CornerRadius=UDim.new(0,6) }) })
+    local btnLabel = New("TextLabel", {
+        Size=UDim2.new(1,-10,1,0), Position=UDim2.new(0,10,0,0),
+        BackgroundTransparency=1, Text=name, Font=Enum.Font.Gotham,
+        TextSize=12, TextColor3=C.TextDim, TextXAlignment=Enum.TextXAlignment.Left,
+        ZIndex=5, Parent=btn,
+    })
+    local scroll = New("ScrollingFrame", {
+        Size=UDim2.fromScale(1,1), BackgroundTransparency=1,
+        ScrollBarThickness=3, ScrollBarImageColor3=C.AccentDim,
+        CanvasSize=UDim2.fromScale(0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y,
+        Visible=false, ZIndex=2, Parent=ContentPanel,
+    }, {
+        New("UIListLayout", { Padding=UDim.new(0,6), FillDirection=Enum.FillDirection.Vertical, SortOrder=Enum.SortOrder.LayoutOrder }),
+        New("UIPadding", { PaddingLeft=UDim.new(0,14), PaddingRight=UDim.new(0,14), PaddingTop=UDim.new(0,12), PaddingBottom=UDim.new(0,12) }),
+    })
+    btn.MouseButton1Click:Connect(function() SwitchTab(name) end)
+    btn.MouseEnter:Connect(function()
+        if ActiveTab ~= name then
+            Tween(btn, T_FAST, {BackgroundTransparency=0.6, BackgroundColor3=C.Element})
+            Tween(btnLabel, T_FAST, {TextColor3=C.Text})
+        end
+    end)
+    btn.MouseLeave:Connect(function()
+        if ActiveTab ~= name then
+            Tween(btn, T_FAST, {BackgroundTransparency=1})
+            Tween(btnLabel, T_FAST, {TextColor3=C.TextDim})
+        end
+    end)
+    local tabObj = { Btn=btn, BtnLabel=btnLabel, Scroll=scroll, Order=0 }
+    Tabs[name] = tabObj
+    local Tab = {}
+    local function NO() tabObj.Order = tabObj.Order+1; return tabObj.Order end
+ 
+    function Tab:CreateSection(title)
+        local f = New("Frame", { Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=NO(), Parent=scroll })
+        New("TextLabel", { Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text=string.upper(title),
+            Font=Enum.Font.GothamBold, TextSize=10, TextColor3=C.Accent,
+            TextXAlignment=Enum.TextXAlignment.Left, ZIndex=3, Parent=f })
+        New("Frame", { Size=UDim2.new(1,0,0,1), Position=UDim2.new(0,0,1,-1),
+            BackgroundColor3=C.Border, BorderSizePixel=0, ZIndex=3, Parent=f })
+    end
+ 
+    function Tab:CreateLabel(text)
+        New("TextLabel", { Size=UDim2.new(1,0,0,22), BackgroundTransparency=1, Text=text,
+            Font=Enum.Font.Gotham, TextSize=11, TextColor3=C.TextMuted,
+            TextXAlignment=Enum.TextXAlignment.Left, TextWrapped=true,
+            LayoutOrder=NO(), ZIndex=3, Parent=scroll })
+    end
+ 
+    function Tab:CreateToggle(config)
+        local val = config.CurrentValue or false
+        local row = New("Frame", { Size=UDim2.new(1,0,0,36), BackgroundColor3=C.Element,
+            BorderSizePixel=0, LayoutOrder=NO(), Parent=scroll,
+        }, { New("UICorner", {CornerRadius=UDim.new(0,7)}) })
+        New("TextLabel", { Size=UDim2.new(1,-58,1,0), Position=UDim2.new(0,12,0,0),
+            BackgroundTransparency=1, Text=config.Name, Font=Enum.Font.Gotham,
+            TextSize=12, TextColor3=C.Text, TextXAlignment=Enum.TextXAlignment.Left, ZIndex=3, Parent=row })
+        local pill = New("Frame", { Size=UDim2.fromOffset(36,20), Position=UDim2.new(1,-46,0.5,-10),
+            BackgroundColor3=val and C.On or C.Off, BorderSizePixel=0, ZIndex=3, Parent=row,
+        }, { New("UICorner", {CornerRadius=UDim.new(1,0)}) })
+        local knob = New("Frame", { Size=UDim2.fromOffset(14,14),
+            Position=val and UDim2.new(1,-17,0.5,-7) or UDim2.new(0,3,0.5,-7),
+            BackgroundColor3=C.White, BorderSizePixel=0, ZIndex=4, Parent=pill,
+        }, { New("UICorner", {CornerRadius=UDim.new(1,0)}) })
+        local function Set(v)
+            val=v
+            Tween(pill, T_FAST, {BackgroundColor3=v and C.On or C.Off})
+            Tween(knob, T_FAST, {Position=v and UDim2.new(1,-17,0.5,-7) or UDim2.new(0,3,0.5,-7)})
+            if config.Callback then config.Callback(v) end
+        end
+        local hb = New("TextButton", { Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text="", ZIndex=5, Parent=row })
+        hb.MouseButton1Click:Connect(function() Set(not val) end)
+        hb.MouseEnter:Connect(function() Tween(row,T_FAST,{BackgroundColor3=C.ElemHov}) end)
+        hb.MouseLeave:Connect(function() Tween(row,T_FAST,{BackgroundColor3=C.Element}) end)
+        -- Register for GUI sync on config load
+        if config.StateGet then
+            RegisterSetter(config.StateGet, function(v) Set(v) end)
+        end
+        return { Set = Set }
+    end
+ 
+    function Tab:CreateSlider(config)
+        local val  = config.CurrentValue or config.Range[1]
+        local minV = config.Range[1]
+        local maxV = config.Range[2]
+        local inc  = config.Increment or 1
+        local suf  = config.Suffix or ""
+        local con  = New("Frame", { Size=UDim2.new(1,0,0,52), BackgroundColor3=C.Element,
+            BorderSizePixel=0, LayoutOrder=NO(), Parent=scroll,
+        }, { New("UICorner", {CornerRadius=UDim.new(0,7)}) })
+        New("TextLabel", { Size=UDim2.new(0.65,-12,0,26), Position=UDim2.new(0,12,0,0),
+            BackgroundTransparency=1, Text=config.Name, Font=Enum.Font.Gotham, TextSize=12,
+            TextColor3=C.Text, TextXAlignment=Enum.TextXAlignment.Left, ZIndex=3, Parent=con })
+        local vl = New("TextLabel", { Size=UDim2.new(0.35,-12,0,26), Position=UDim2.new(0.65,0,0,0),
+            BackgroundTransparency=1, Text=tostring(val)..suf, Font=Enum.Font.GothamBold,
+            TextSize=11, TextColor3=C.Accent, TextXAlignment=Enum.TextXAlignment.Right, ZIndex=3, Parent=con })
+        local trk = New("Frame", { Size=UDim2.new(1,-24,0,6), Position=UDim2.new(0,12,0,36),
+            BackgroundColor3=C.SliderBG, BorderSizePixel=0, ZIndex=3, Parent=con,
+        }, { New("UICorner", {CornerRadius=UDim.new(1,0)}) })
+        local ip  = (val-minV)/(maxV-minV)
+        local fil = New("Frame", { Size=UDim2.new(ip,0,1,0), BackgroundColor3=C.SliderFill,
+            BorderSizePixel=0, ZIndex=4, Parent=trk,
+        }, { New("UICorner", {CornerRadius=UDim.new(1,0)}) })
+        local th  = New("Frame", { Size=UDim2.fromOffset(12,12), Position=UDim2.new(ip,-6,0.5,-6),
+            BackgroundColor3=C.White, BorderSizePixel=0, ZIndex=5, Parent=trk,
+        }, { New("UICorner", {CornerRadius=UDim.new(1,0)}) })
+        local function SV(pct)
+            pct    = math.clamp(pct,0,1)
+            local sv = math.clamp(math.round((minV+pct*(maxV-minV))/inc)*inc, minV, maxV)
+            val    = sv; local dp = (sv-minV)/(maxV-minV)
+            fil.Size=UDim2.new(dp,0,1,0); th.Position=UDim2.new(dp,-6,0.5,-6)
+            vl.Text=tostring(sv)..suf
+            if config.Callback then config.Callback(sv) end
+        end
+        local ha = New("TextButton", { Size=UDim2.new(1,0,0,22), Position=UDim2.new(0,0,0.5,-11),
+            BackgroundTransparency=1, Text="", ZIndex=6, Parent=trk })
+        ha.MouseButton1Down:Connect(function()
+            _activeSlide = { sv=SV, trk=trk }
+            SV((UserInputService:GetMouseLocation().X - trk.AbsolutePosition.X) / trk.AbsoluteSize.X)
+        end)
+        con.MouseEnter:Connect(function() Tween(con,T_FAST,{BackgroundColor3=C.ElemHov}) end)
+        con.MouseLeave:Connect(function() Tween(con,T_FAST,{BackgroundColor3=C.Element}) end)
+        -- Register for GUI sync on config load
+        if config.StateGet then
+            RegisterSetter(config.StateGet, function(v)
+                local pct = (v - minV) / math.max(maxV - minV, 0.001)
+                SV(pct)
+            end)
+        end
+        return { Set = function(v)
+            local pct = (v - minV) / math.max(maxV - minV, 0.001)
+            SV(pct)
+        end }
+    end
+ 
+    function Tab:CreateColorPicker(config)
+        local curCol   = config.Color or Color3.fromRGB(255,255,255)
+        local rbOn     = false
+        local noRB     = config.NoRainbow == true   -- suppress the rainbow pill
+        local con = New("Frame", { Size=UDim2.new(1,0,0,36), BackgroundColor3=C.Element,
+            BorderSizePixel=0, LayoutOrder=NO(), Parent=scroll,
+        }, { New("UICorner", {CornerRadius=UDim.new(0,7)}) })
+        New("TextLabel", { Size=UDim2.new(1,-90,1,0), Position=UDim2.new(0,12,0,0),
+            BackgroundTransparency=1, Text=config.Name, Font=Enum.Font.Gotham, TextSize=12,
+            TextColor3=C.Text, TextXAlignment=Enum.TextXAlignment.Left, ZIndex=3, Parent=con })
+        -- Rainbow toggle pill (hidden when NoRainbow=true)
+        local rbPill = New("Frame", { Size=UDim2.fromOffset(28,16), Position=UDim2.new(1,-66,0.5,-8),
+            BackgroundColor3=C.Off, BorderSizePixel=0, ZIndex=4, Visible=not noRB, Parent=con,
+        }, { New("UICorner",{CornerRadius=UDim.new(1,0)}) })
+        New("TextLabel", { Size=UDim2.new(1,0,0,10), Position=UDim2.new(0,0,-0.5,0),
+            BackgroundTransparency=1, Text="RB", Font=Enum.Font.GothamBold,
+            TextSize=7, TextColor3=C.TextMuted, TextXAlignment=Enum.TextXAlignment.Center,
+            ZIndex=5, Parent=rbPill })
+        local rbKnob = New("Frame", { Size=UDim2.fromOffset(10,10), Position=UDim2.new(0,3,0.5,-5),
+            BackgroundColor3=C.White, BorderSizePixel=0, ZIndex=5, Parent=rbPill,
+        }, { New("UICorner",{CornerRadius=UDim.new(1,0)}) })
+        local function SetRB(v)
+            rbOn = v
+            Tween(rbPill, T_FAST, {BackgroundColor3=v and C.On or C.Off})
+            Tween(rbKnob, T_FAST, {Position=v and UDim2.new(1,-13,0.5,-5) or UDim2.new(0,3,0.5,-5)})
+            if config.RainbowCallback then config.RainbowCallback(v) end
+        end
+        if not noRB then
+            local rbHB = New("TextButton", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text="", ZIndex=6, Parent=rbPill})
+            rbHB.MouseButton1Click:Connect(function() SetRB(not rbOn) end)
+        end
+        -- Color swatch: shift right when no RB pill
+        local swX = noRB and -36 or -36
+        local sw = New("Frame", { Size=UDim2.fromOffset(22,22), Position=UDim2.new(1,-36,0.5,-11),
+            BackgroundColor3=curCol, BorderSizePixel=0, ZIndex=4, Parent=con,
+        }, { New("UICorner",{CornerRadius=UDim.new(0,4)}), New("UIStroke",{Color=C.Border,Thickness=1}) })
+        local presets = {
+            Color3.fromRGB(255,0,0),    Color3.fromRGB(255,165,0), Color3.fromRGB(255,255,0),
+            Color3.fromRGB(0,255,80),   Color3.fromRGB(0,200,255), Color3.fromRGB(99,130,255),
+            Color3.fromRGB(180,0,255),  Color3.fromRGB(255,100,180),
+            Color3.fromRGB(255,255,255),Color3.fromRGB(150,150,150),
+        }
+        local popup = New("Frame", { Size=UDim2.fromOffset(164,68),
+            BackgroundColor3=C.Panel, BorderSizePixel=0, Visible=false, ZIndex=200, Parent=ScreenGui,
+        }, {
+            New("UICorner",    {CornerRadius=UDim.new(0,7)}),
+            New("UIStroke",    {Color=C.Border,Thickness=1}),
+            New("UIGridLayout",{CellSize=UDim2.fromOffset(20,20), CellPadding=UDim2.fromOffset(4,4)}),
+            New("UIPadding",   {PaddingLeft=UDim.new(0,8),PaddingRight=UDim.new(0,8),PaddingTop=UDim.new(0,8)}),
+        })
+        local ref = { frame=popup, open=false }
+        table.insert(OpenPopups, ref)
+        for _, col in ipairs(presets) do
+            local cell = New("TextButton", { Size=UDim2.fromOffset(20,20), BackgroundColor3=col,
+                Text="", BorderSizePixel=0, ZIndex=201, Parent=popup,
+            }, { New("UICorner",{CornerRadius=UDim.new(0,4)}) })
+            cell.MouseButton1Click:Connect(function()
+                curCol=col; sw.BackgroundColor3=col
+                popup.Visible=false; ref.open=false
+                if config.Callback then config.Callback(col) end
+            end)
+        end
+        local sb = New("TextButton", { Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text="", ZIndex=5, Parent=sw })
+        sb.MouseButton1Click:Connect(function()
+            CloseAllPopups()
+            if not ref.open then
+                local ap=sw.AbsolutePosition; local as=sw.AbsoluteSize
+                local py=ap.Y-68-4; if py<0 then py=ap.Y+as.Y+4 end
+                popup.Position=UDim2.fromOffset(ap.X-140, py)
+                popup.Visible=true; ref.open=true
+            end
+        end)
+        con.MouseEnter:Connect(function() Tween(con,T_FAST,{BackgroundColor3=C.ElemHov}) end)
+        con.MouseLeave:Connect(function() Tween(con,T_FAST,{BackgroundColor3=C.Element}) end)
+        -- Register rainbow state for GUI sync if getter provided
+        if config.RainbowStateGet then
+            RegisterSetter(config.RainbowStateGet, function(v) SetRB(v) end)
+        end
+    end
+ 
+    function Tab:CreateButton(config)
+        local b = New("TextButton", { Size=UDim2.new(1,0,0,34), BackgroundColor3=C.Element,
+            BorderSizePixel=0, LayoutOrder=NO(), Text="", Parent=scroll,
+        }, { New("UICorner",{CornerRadius=UDim.new(0,7)}) })
+        New("TextLabel", { Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text=config.Name,
+            Font=Enum.Font.GothamBold, TextSize=12, TextColor3=C.Accent, ZIndex=3, Parent=b })
+        b.MouseButton1Click:Connect(function() if config.Callback then config.Callback() end end)
+        b.MouseEnter:Connect(function() Tween(b,T_FAST,{BackgroundColor3=C.ElemHov}) end)
+        b.MouseLeave:Connect(function() Tween(b,T_FAST,{BackgroundColor3=C.Element}) end)
+    end
+ 
+    function Tab:CreateDisplay(config)
+        local row = New("Frame", { Size=UDim2.new(1,0,0,36), BackgroundColor3=C.Element,
+            BorderSizePixel=0, LayoutOrder=NO(), Parent=scroll,
+        }, { New("UICorner",{CornerRadius=UDim.new(0,7)}) })
+        New("TextLabel", { Size=UDim2.new(0.4,0,1,0), Position=UDim2.new(0,12,0,0),
+            BackgroundTransparency=1, Text=config.Name, Font=Enum.Font.Gotham, TextSize=12,
+            TextColor3=C.TextDim, TextXAlignment=Enum.TextXAlignment.Left, ZIndex=3, Parent=row })
+        local vl = New("TextLabel", { Size=UDim2.new(0.6,-12,1,0), Position=UDim2.new(0.4,0,0,0),
+            BackgroundTransparency=1, Text=config.DefaultText or "", Font=Enum.Font.GothamBold,
+            TextSize=11, TextColor3=C.Accent, TextXAlignment=Enum.TextXAlignment.Right, ZIndex=3, Parent=row })
+        return function(t) vl.Text = t end
+    end
+ 
+    function Tab:CreateTextInput(config)
+        local con = New("Frame", { Size=UDim2.new(1,0,0,56), BackgroundColor3=C.Element,
+            BorderSizePixel=0, LayoutOrder=NO(), Parent=scroll,
+        }, { New("UICorner",{CornerRadius=UDim.new(0,7)}) })
+        New("TextLabel", { Size=UDim2.new(1,-24,0,22), Position=UDim2.new(0,12,0,0),
+            BackgroundTransparency=1, Text=config.Name, Font=Enum.Font.Gotham, TextSize=12,
+            TextColor3=C.Text, TextXAlignment=Enum.TextXAlignment.Left, ZIndex=3, Parent=con })
+        local tb = New("TextBox", {
+            Size=UDim2.new(1,-24,0,26), Position=UDim2.new(0,12,0,24),
+            BackgroundColor3=C.SliderBG, BorderSizePixel=0,
+            Text=config.DefaultText or "", PlaceholderText=config.Placeholder or "...",
+            Font=Enum.Font.Gotham, TextSize=12, TextColor3=C.Text,
+            PlaceholderColor3=C.TextMuted, ClearTextOnFocus=false,
+            ZIndex=4, Parent=con,
+        }, {
+            New("UICorner",{CornerRadius=UDim.new(0,5)}),
+            New("UIPadding",{PaddingLeft=UDim.new(0,6),PaddingRight=UDim.new(0,6)}),
+        })
+        tb.FocusLost:Connect(function()
+            if config.Callback then config.Callback(tb.Text) end
+        end)
+        con.MouseEnter:Connect(function() Tween(con,T_FAST,{BackgroundColor3=C.ElemHov}) end)
+        con.MouseLeave:Connect(function() Tween(con,T_FAST,{BackgroundColor3=C.Element}) end)
+    end
+ 
+    function Tab:CreateKeybind(config)
+        local curKey  = config.DefaultKey or "MouseButton2"
+        local listening = false
+        local row = New("Frame", { Size=UDim2.new(1,0,0,36), BackgroundColor3=C.Element,
+            BorderSizePixel=0, LayoutOrder=NO(), Parent=scroll,
+        }, { New("UICorner",{CornerRadius=UDim.new(0,7)}) })
+        New("TextLabel", { Size=UDim2.new(0.6,0,1,0), Position=UDim2.new(0,12,0,0),
+            BackgroundTransparency=1, Text=config.Name, Font=Enum.Font.Gotham, TextSize=12,
+            TextColor3=C.Text, TextXAlignment=Enum.TextXAlignment.Left, ZIndex=3, Parent=row })
+        local kb = New("TextButton", {
+            Size=UDim2.new(0.38,0,0,22), Position=UDim2.new(0.62,0,0.5,-11),
+            BackgroundColor3=C.SliderBG, BorderSizePixel=0, Text=curKey,
+            Font=Enum.Font.GothamBold, TextSize=10, TextColor3=C.Accent, ZIndex=4, Parent=row,
+        }, { New("UICorner",{CornerRadius=UDim.new(0,5)}) })
+        kb.MouseButton1Click:Connect(function()
+            if listening then return end
+            listening=true; kb.Text="..."; kb.TextColor3=C.TextDim
+            local conn
+            conn = UserInputService.InputBegan:Connect(function(inp, gpe)
+                if gpe then return end
+                listening=false; conn:Disconnect()
+                local kn
+                if      inp.UserInputType == Enum.UserInputType.MouseButton2 then kn="MouseButton2"
+                elseif  inp.UserInputType == Enum.UserInputType.MouseButton1 then kn="MouseButton1"
+                elseif  inp.UserInputType == Enum.UserInputType.MouseButton3 then kn="MouseButton3"
+                elseif  inp.UserInputType == Enum.UserInputType.Keyboard      then kn=inp.KeyCode.Name
+                else kn=curKey end
+                curKey=kn; kb.Text=kn; kb.TextColor3=C.Accent
+                if config.Callback then config.Callback(kn) end
+            end)
+        end)
+        row.MouseEnter:Connect(function() Tween(row,T_FAST,{BackgroundColor3=C.ElemHov}) end)
+        row.MouseLeave:Connect(function() Tween(row,T_FAST,{BackgroundColor3=C.Element}) end)
+    end
+ 
+    return Tab
+end
+ 
+-- ============================================================
+-- // NOTIFICATION
+-- ============================================================
+ 
+-- FIX: assigned here to fill the forward-declaration made before CFGAutoLoad.
+PolarisNotify = function(title, content, duration)
+    local notif = New("Frame", { Size=UDim2.fromOffset(240,56), BackgroundColor3=C.Panel,
+        BorderSizePixel=0, ZIndex=100, Parent=ScreenGui,
+    }, { New("UICorner",{CornerRadius=UDim.new(0,8)}), New("UIStroke",{Color=C.Accent,Thickness=1}) })
+    New("Frame", { Size=UDim2.fromOffset(3,36), Position=UDim2.new(0,0,0.5,-18),
+        BackgroundColor3=C.Accent, BorderSizePixel=0, ZIndex=101, Parent=notif,
+    }, { New("UICorner",{CornerRadius=UDim.new(1,0)}) })
+    New("TextLabel", { Size=UDim2.new(1,-18,0,18), Position=UDim2.new(0,14,0,8),
+        BackgroundTransparency=1, Text=title, Font=Enum.Font.GothamBold, TextSize=12,
+        TextColor3=C.Text, TextXAlignment=Enum.TextXAlignment.Left, ZIndex=101, Parent=notif })
+    New("TextLabel", { Size=UDim2.new(1,-18,0,14), Position=UDim2.new(0,14,0,28),
+        BackgroundTransparency=1, Text=content, Font=Enum.Font.Gotham, TextSize=10,
+        TextColor3=C.TextDim, TextXAlignment=Enum.TextXAlignment.Left, ZIndex=101, Parent=notif })
+    notif.Position = UDim2.new(1,16,1,-72)
+    Tween(notif, T_MED, {Position=UDim2.new(1,-256,1,-72)})
+    task.delay(duration or 4, function()
+        Tween(notif, T_MED, {Position=UDim2.new(1,16,1,-72)})
+        task.wait(0.3)
+        if notif and notif.Parent then notif:Destroy() end
+    end)
+end
+ 
+-- ============================================================
+-- // BUILD TABS
+-- ============================================================
+ 
+local AimbotTab   = CreateTab("Aimbot")
+local ESPTab      = CreateTab("ESP")
+local MovementTab = CreateTab("Movement")
+local MusicTab    = CreateTab("Music")
+local VisualTab   = CreateTab("Visuals")
+local HitboxTab   = CreateTab("Hitbox")
+local MiscTab     = CreateTab("Misc")
+local ConfigsTab  = CreateTab("Configs")
+ 
+-- ── AIMBOT ────────────────────────────────────────────────────
+ 
+AimbotTab:CreateSection("Aimbot")
+AimbotTab:CreateToggle({ Name="Enable Aimbot", CurrentValue=false,
+    StateGet=function() return State.Aimbot.Enabled end,
+    Callback=function(v) State.Aimbot.Enabled=v; SetupAimbot() end })
+AimbotTab:CreateToggle({ Name="Stay Locked (hold key = same target)", CurrentValue=false,
+    StateGet=function() return State.Aimbot.KeepLocked end,
+    Callback=function(v) State.Aimbot.KeepLocked=v end })
+AimbotTab:CreateToggle({ Name="Wall Check (Raycast)", CurrentValue=false,
+    StateGet=function() return State.Aimbot.WallCheck end,
+    Callback=function(v) State.Aimbot.WallCheck=v end })
+AimbotTab:CreateToggle({ Name="Prediction", CurrentValue=false,
+    StateGet=function() return State.Aimbot.Prediction end,
+    Callback=function(v) State.Aimbot.Prediction=v end })
+AimbotTab:CreateSlider({ Name="Prediction Strength", Range={1,200}, Increment=1, Suffix="ms", CurrentValue=65,
+    StateGet=function() return math.floor(State.Aimbot.PredictionStrength*1000+0.5) end,
+    Callback=function(v) State.Aimbot.PredictionStrength=v/1000 end })
+AimbotTab:CreateSlider({ Name="Aim Speed", Range={1,100}, Increment=1, Suffix="%", CurrentValue=50,
+    StateGet=function() return math.floor(State.Aimbot.Smoothness*100+0.5) end,
+    Callback=function(v) State.Aimbot.Smoothness=v/100 end })
+AimbotTab:CreateSlider({ Name="FOV Radius", Range={10,500}, Increment=5, Suffix="px", CurrentValue=150,
+    StateGet=function() return State.Aimbot.FOV end,
+    Callback=function(v) State.Aimbot.FOV=v end })
+AimbotTab:CreateColorPicker({ Name="FOV Circle Color", Color=Color3.fromRGB(255,0,0),
+    RainbowStateGet=function() return State.Aimbot.RainbowFOV end,
+    RainbowCallback=function(v) State.Aimbot.RainbowFOV=v end,
+    Callback=function(v) State.Aimbot.Color=v end })
+AimbotTab:CreateSlider({ Name="Rainbow Speed", Range={1,200}, Increment=1, Suffix="x", CurrentValue=40,
+    StateGet=function() return math.floor(State.Aimbot.RainbowSpeed*100+0.5) end,
+    Callback=function(v) State.Aimbot.RainbowSpeed=v/100 end })
+AimbotTab:CreateSection("Target Bone")
+AimbotTab:CreateLabel("Select which body part the aimbot aims at:")
+do
+    local partOpts = {
+        { lbl="Head",             key="Head"            },
+        { lbl="Torso",            key="Torso"           },
+        { lbl="HumanoidRootPart", key="HumanoidRootPart"},
+        { lbl="Right Arm",        key="Right Arm"       },
+        { lbl="Left Arm",         key="Left Arm"        },
+        { lbl="Right Leg",        key="Right Leg"       },
+        { lbl="Left Leg",         key="Left Leg"        },
+    }
+    local partBtns = {}
+    local ms = Tabs["Aimbot"].Scroll
+    local function SelPart(key)
+        State.Aimbot.TargetPart = key
+        for k, b in pairs(partBtns) do
+            Tween(b, T_FAST, { BackgroundColor3 = k==key and C.AccentDim or C.Element })
+        end
+    end
+    for _, opt in ipairs(partOpts) do
+        local to = Tabs["Aimbot"].Order + 1
+        Tabs["Aimbot"].Order = to
+        local b = New("TextButton", {
+            Size=UDim2.new(1,0,0,30),
+            BackgroundColor3 = opt.key=="Head" and C.AccentDim or C.Element,
+            BorderSizePixel=0, LayoutOrder=to, Text=opt.lbl,
+            Font=Enum.Font.Gotham, TextSize=11, TextColor3=C.Text, Parent=ms,
+        }, { New("UICorner",{CornerRadius=UDim.new(0,6)}) })
+        partBtns[opt.key] = b
+        b.MouseButton1Click:Connect(function() SelPart(opt.key) end)
+        b.MouseEnter:Connect(function() if State.Aimbot.TargetPart~=opt.key then Tween(b,T_FAST,{BackgroundColor3=C.ElemHov}) end end)
+        b.MouseLeave:Connect(function() if State.Aimbot.TargetPart~=opt.key then Tween(b,T_FAST,{BackgroundColor3=C.Element}) end end)
+    end
+end
+AimbotTab:CreateSection("Team")
+AimbotTab:CreateToggle({ Name="Team Check (skip teammates)", CurrentValue=false,
+    StateGet=function() return State.Aimbot.TeamCheck end,
+    Callback=function(v) State.Aimbot.TeamCheck=v end })
+AimbotTab:CreateSection("Lock Key")
+AimbotTab:CreateKeybind({ Name="Aim Hold Key", DefaultKey="MouseButton2",
+    Callback=function(v) State.Aimbot.LockKey=v end })
+AimbotTab:CreateSection("Triggerbot")
+AimbotTab:CreateToggle({ Name="Enable Triggerbot", CurrentValue=false,
+    StateGet=function() return State.Triggerbot.Enabled end,
+    Callback=function(v) State.Triggerbot.Enabled=v end })
+AimbotTab:CreateToggle({ Name="Spam Mode (hold LMB while in view)", CurrentValue=false,
+    StateGet=function() return State.Triggerbot.Spam end,
+    Callback=function(v) State.Triggerbot.Spam=v end })
+AimbotTab:CreateToggle({ Name="Triggerbot Wall Check", CurrentValue=false,
+    StateGet=function() return State.Triggerbot.WallCheck end,
+    Callback=function(v) State.Triggerbot.WallCheck=v end })
+AimbotTab:CreateToggle({ Name="Triggerbot Team Check", CurrentValue=false,
+    StateGet=function() return State.Triggerbot.TeamCheck end,
+    Callback=function(v) State.Triggerbot.TeamCheck=v end })
+AimbotTab:CreateSlider({ Name="Crosshair Radius", Range={1,80}, Increment=1, Suffix="px", CurrentValue=15,
+    StateGet=function() return State.Triggerbot.Radius end,
+    Callback=function(v) State.Triggerbot.Radius=v end })
+AimbotTab:CreateSlider({ Name="Spam Delay", Range={1,100}, Increment=1, Suffix="ms", CurrentValue=80,
+    StateGet=function() return math.floor(State.Triggerbot.Delay*1000+0.5) end,
+    Callback=function(v) State.Triggerbot.Delay=v/1000 end })
+ 
+-- ── ESP ───────────────────────────────────────────────────────
+ 
+ESPTab:CreateSection("ESP")
+ESPTab:CreateToggle({ Name="Enable ESP", CurrentValue=false,
+    StateGet=function() return State.ESP.Enabled end,
+    Callback=function(v) State.ESP.Enabled=v; SetupESP() end })
+ESPTab:CreateSlider({ Name="Render Distance", Range={50,2000}, Increment=50, Suffix=" st", CurrentValue=500,
+    StateGet=function() return State.ESP.MaxDist end,
+    Callback=function(v) State.ESP.MaxDist=v end })
+ESPTab:CreateToggle({ Name="Box ESP",       CurrentValue=false,
+    StateGet=function() return State.ESP.Box end,
+    Callback=function(v) State.ESP.Box=v       end })
+ESPTab:CreateToggle({ Name="Skeleton ESP",  CurrentValue=false,
+    StateGet=function() return State.ESP.Skeleton end,
+    Callback=function(v) State.ESP.Skeleton=v  end })
+ESPTab:CreateToggle({ Name="Names ESP",     CurrentValue=false,
+    StateGet=function() return State.ESP.Names end,
+    Callback=function(v) State.ESP.Names=v     end })
+ESPTab:CreateToggle({ Name="Distance ESP",  CurrentValue=false,
+    StateGet=function() return State.ESP.Distance end,
+    Callback=function(v) State.ESP.Distance=v  end })
+ESPTab:CreateToggle({ Name="Highlight ESP", CurrentValue=false,
+    StateGet=function() return State.ESP.Highlight end,
+    Callback=function(v) State.ESP.Highlight=v end })
+ESPTab:CreateToggle({ Name="Tracer ESP",    CurrentValue=false,
+    StateGet=function() return State.ESP.Tracer end,
+    Callback=function(v) State.ESP.Tracer=v    end })
+ESPTab:CreateColorPicker({ Name="ESP Color", Color=Color3.fromRGB(255,255,255),
+    RainbowStateGet=function() return State.ESP.Rainbow end,
+    RainbowCallback=function(v) State.ESP.Rainbow=v end,
+    Callback=function(v) State.ESP.Color=v end })
+ESPTab:CreateSlider({ Name="Rainbow Speed", Range={1,200}, Increment=1, Suffix="x", CurrentValue=40,
+    StateGet=function() return math.floor(State.ESP.RainbowSpeed*100+0.5) end,
+    Callback=function(v) State.ESP.RainbowSpeed=v/100 end })
+ESPTab:CreateSection("Team Check")
+ESPTab:CreateToggle({ Name="Team Check", CurrentValue=false,
+    Callback=function(v) State.ESP.TeamCheck=v end })
+do
+    ESPTab:CreateLabel("Team Mode:")
+    local ms = Tabs["ESP"].Scroll
+    local modeBtns = {}
+    local function SelESPTeamMode(mode)
+        State.ESP.TeamMode = mode
+        for m, b in pairs(modeBtns) do
+            Tween(b, T_FAST, { BackgroundColor3 = m==mode and C.AccentDim or C.Element })
+        end
+    end
+    local function MkTeamBtn(lbl, modeKey, lo)
+        local b = New("TextButton", {
+            Size=UDim2.new(1,0,0,30),
+            BackgroundColor3 = modeKey=="hide" and C.AccentDim or C.Element,
+            BorderSizePixel=0, LayoutOrder=lo, Text=lbl,
+            Font=Enum.Font.Gotham, TextSize=11, TextColor3=C.Text, Parent=ms,
+        }, { New("UICorner",{CornerRadius=UDim.new(0,6)}) })
+        modeBtns[modeKey] = b
+        b.MouseButton1Click:Connect(function() SelESPTeamMode(modeKey) end)
+        b.MouseEnter:Connect(function() if State.ESP.TeamMode~=modeKey then Tween(b,T_FAST,{BackgroundColor3=C.ElemHov}) end end)
+        b.MouseLeave:Connect(function() if State.ESP.TeamMode~=modeKey then Tween(b,T_FAST,{BackgroundColor3=C.Element}) end end)
+    end
+    local to = Tabs["ESP"].Order
+    MkTeamBtn("Mode: Hide teammates",     "hide",  to+1)
+    MkTeamBtn("Mode: Color + TEAM label", "color", to+2)
+    Tabs["ESP"].Order = to+2
+end
+ESPTab:CreateColorPicker({ Name="Team Color", Color=Color3.fromRGB(0,255,120),
+    NoRainbow=true,
+    Callback=function(v) State.ESP.TeamColor=v end })
+ 
+-- ── MOVEMENT ──────────────────────────────────────────────────
+ 
+MovementTab:CreateSection("Walk Speed")
+MovementTab:CreateToggle({ Name="Custom WalkSpeed", CurrentValue=false,
+    Callback=function(v) State.Movement.WalkSpeed=v; ApplyWalkSpeed() end })
+MovementTab:CreateSlider({ Name="Walk Speed", Range={0,500}, Increment=1, CurrentValue=16,
+    Callback=function(v) State.Movement.WalkSpeedValue=v; if State.Movement.WalkSpeed then ApplyWalkSpeed() end end })
+ 
+MovementTab:CreateSection("Teleport Walk")
+MovementTab:CreateToggle({ Name="TPWalk", CurrentValue=false,
+    Callback=function(v) State.Movement.TPWalk=v; SetupTPWalk() end })
+MovementTab:CreateToggle({ Name="Tween Mode (off = instant teleport)", CurrentValue=false,
+    Callback=function(v) State.Movement.TPWalkTween=v; if State.Movement.TPWalk then SetupTPWalk() end end })
+MovementTab:CreateSlider({ Name="TPWalk Speed", Range={1,300}, Increment=1, CurrentValue=50,
+    Callback=function(v) State.Movement.TPWalkSpeed=v end })
+ 
+MovementTab:CreateSection("Jump")
+MovementTab:CreateToggle({ Name="Custom Jump Power", CurrentValue=false,
+    Callback=function(v)
+        State.Movement.JumpPower=v
+        local h=GetHumanoid(LocalPlayer)
+        if h then h.JumpPower = v and State.Movement.JumpPowerValue or Defaults.JumpPower end
+    end })
+MovementTab:CreateSlider({ Name="Jump Power", Range={0,500}, Increment=1, CurrentValue=50,
+    Callback=function(v)
+        State.Movement.JumpPowerValue=v
+        if State.Movement.JumpPower then
+            local h=GetHumanoid(LocalPlayer); if h then h.JumpPower=v end
+        end
+    end })
+MovementTab:CreateToggle({ Name="Infinite Jump", CurrentValue=false,
+    Callback=function(v) State.Movement.InfJump=v; SetupInfJump() end })
+ 
+MovementTab:CreateSection("Fly")
+MovementTab:CreateToggle({ Name="Fly", CurrentValue=false,
+    Callback=function(v) State.Movement.Fly=v; SetupFly() end })
+MovementTab:CreateSlider({ Name="Fly Speed", Range={0,300}, Increment=1, CurrentValue=50,
+    Callback=function(v) State.Movement.FlySpeed=v end })
+ 
+MovementTab:CreateSection("Spin")
+MovementTab:CreateToggle({ Name="Spin", CurrentValue=false,
+    Callback=function(v) State.Movement.Spin=v; SetupSpin() end })
+MovementTab:CreateSlider({ Name="Spin Speed", Range={1,100}, Increment=1, CurrentValue=20,
+    Callback=function(v) State.Movement.SpinSpeed=v end })
+ 
+MovementTab:CreateSection("Click Teleport")
+MovementTab:CreateToggle({ Name="Click Tween TP", CurrentValue=false,
+    Callback=function(v) State.Movement.ClickTweenTP=v; if v then State.Movement.ClickTP=false end end })
+MovementTab:CreateSlider({ Name="Tween TP Speed", Range={1,100}, Increment=1, CurrentValue=5,
+    Callback=function(v) State.Movement.ClickTweenTPSpeed=v end })
+MovementTab:CreateToggle({ Name="Click TP (Instant)", CurrentValue=false,
+    Callback=function(v) State.Movement.ClickTP=v; if v then State.Movement.ClickTweenTP=false end end })
+ 
+MovementTab:CreateSection("Utility")
+MovementTab:CreateToggle({ Name="Noclip", CurrentValue=false,
+    Callback=function(v) State.Movement.Noclip=v; SetupNoclip() end })
+MovementTab:CreateToggle({ Name="GodMode", CurrentValue=false,
+    Callback=function(v) State.Movement.GodMode=v; SetupGodMode() end })
+ 
+MovementTab:CreateSection("Orbit")
+MovementTab:CreateToggle({ Name="Player Orbit", CurrentValue=false,
+    Callback=function(v) State.Movement.Orbit=v; SetupOrbit() end })
+MovementTab:CreateSlider({ Name="Orbit Speed", Range={1,200}, Increment=1, CurrentValue=20,
+    Callback=function(v) State.Movement.OrbitSpeed=v end })
+MovementTab:CreateSlider({ Name="Orbit Radius", Range={2,30}, Increment=1, CurrentValue=5,
+    Callback=function(v) State.Movement.OrbitRadius=v end })
+ 
+do
+    local modeBtns = {}
+    local function SelMode(mode)
+        State.Movement.OrbitMode = mode
+        for m, b in pairs(modeBtns) do
+            Tween(b, T_FAST, { BackgroundColor3 = m==mode and C.AccentDim or C.Element })
+        end
+        if State.Movement.Orbit then SetupOrbit() end
+    end
+    local ms = Tabs["Movement"].Scroll
+    local function MkBtn(lbl, modeKey, lo)
+        local b = New("TextButton", {
+            Size=UDim2.new(1,0,0,30), BackgroundColor3=modeKey=="click" and C.AccentDim or C.Element,
+            BorderSizePixel=0, LayoutOrder=lo, Text=lbl,
+            Font=Enum.Font.Gotham, TextSize=11, TextColor3=C.Text, Parent=ms,
+        }, { New("UICorner",{CornerRadius=UDim.new(0,6)}) })
+        modeBtns[modeKey] = b
+        b.MouseButton1Click:Connect(function() SelMode(modeKey) end)
+        b.MouseEnter:Connect(function() if State.Movement.OrbitMode~=modeKey then Tween(b,T_FAST,{BackgroundColor3=C.ElemHov}) end end)
+        b.MouseLeave:Connect(function() if State.Movement.OrbitMode~=modeKey then Tween(b,T_FAST,{BackgroundColor3=C.Element}) end end)
+    end
+    local to = Tabs["Movement"].Order
+    MkBtn("Mode: Click to Select", "click",   to+1)
+    MkBtn("Mode: Nearest Player",  "nearest", to+2)
+    MkBtn("Mode: Auto Random",     "auto",    to+3)
+    Tabs["Movement"].Order = to+3
+    MovementTab:CreateSlider({ Name="Auto Switch Cooldown", Range={1,100}, Increment=1, CurrentValue=10,
+        Callback=function(v) State.Movement.OrbitCooldown = v / 10 end })
+end
+ 
+-- ── MUSIC ─────────────────────────────────────────────────────
+ 
+MusicTab:CreateSection("Built-in Presets")
+do
+    local builtinList = {
+        { name="Hava Nagila",      id="1840529306"       },
+        { name="Clair de Lune",    id="89577183427975"   },
+        { name="Moonlight Sonata", id="1848050065"       },
+    }
+    for _, preset in ipairs(builtinList) do
+        MusicTab:CreateButton({ Name=preset.name,
+            Callback=function()
+                State.Music.ID     = preset.id
+                MusicSound.SoundId = "rbxassetid://" .. preset.id
+                ApplyMusicSettings()
+                MusicSound:Play()
+                State.Music.Playing = true
+                PolarisNotify("Music", "Playing: " .. preset.name, 3)
+            end
+        })
+    end
+end
+ 
+MusicTab:CreateSection("Custom Presets")
+MusicTab:CreateLabel("Add your own presets. They save with your config.")
+ 
+-- Container for dynamic custom preset buttons
+local customPresetScroll = Tabs["Music"].Scroll
+local customPresetLO = {}   -- track LayoutOrders of custom preset buttons so we can refresh
+ 
+local function RefreshCustomPresets()
+    -- Remove all existing custom preset buttons (tagged by LayoutOrder range)
+    for _, inst in ipairs(customPresetLO) do
+        pcall(function() if inst and inst.Parent then inst:Destroy() end end)
+    end
+    customPresetLO = {}
+    for _, preset in ipairs(State.Music.CustomPresets) do
+        local to = Tabs["Music"].Order + 1; Tabs["Music"].Order = to
+        local row = New("Frame", { Size=UDim2.new(1,0,0,36), BackgroundColor3=C.Element,
+            BorderSizePixel=0, LayoutOrder=to, Parent=customPresetScroll,
+        }, { New("UICorner",{CornerRadius=UDim.new(0,7)}) })
+        table.insert(customPresetLO, row)
+        New("TextLabel", { Size=UDim2.new(1,-80,1,0), Position=UDim2.new(0,10,0,0),
+            BackgroundTransparency=1, Text=preset.name, Font=Enum.Font.Gotham, TextSize=11,
+            TextColor3=C.Text, TextXAlignment=Enum.TextXAlignment.Left, ZIndex=3, Parent=row })
+        -- Play button
+        local playB = New("TextButton", { Size=UDim2.fromOffset(36,22), Position=UDim2.new(1,-76,0.5,-11),
+            BackgroundColor3=C.AccentDim, BorderSizePixel=0,
+            Text="Play", Font=Enum.Font.GothamBold, TextSize=9, TextColor3=C.White,
+            ZIndex=4, Parent=row,
+        }, { New("UICorner",{CornerRadius=UDim.new(0,5)}) })
+        local pid = preset.id
+        local pname = preset.name
+        playB.MouseButton1Click:Connect(function()
+            State.Music.ID = pid
+            MusicSound.SoundId = "rbxassetid://" .. pid
+            ApplyMusicSettings(); MusicSound:Play(); State.Music.Playing = true
+            PolarisNotify("Music", "Playing: " .. pname, 3)
+        end)
+        playB.MouseEnter:Connect(function() Tween(playB,T_FAST,{BackgroundColor3=C.Accent}) end)
+        playB.MouseLeave:Connect(function() Tween(playB,T_FAST,{BackgroundColor3=C.AccentDim}) end)
+        -- Delete button
+        local delB = New("TextButton", { Size=UDim2.fromOffset(36,22), Position=UDim2.new(1,-36,0.5,-11),
+            BackgroundColor3=C.Red, BorderSizePixel=0,
+            Text="Del", Font=Enum.Font.GothamBold, TextSize=9, TextColor3=C.White,
+            ZIndex=4, Parent=row,
+        }, { New("UICorner",{CornerRadius=UDim.new(0,5)}) })
+        delB.MouseButton1Click:Connect(function()
+            for i, p in ipairs(State.Music.CustomPresets) do
+                if p.name == pname and p.id == pid then
+                    table.remove(State.Music.CustomPresets, i); break
+                end
+            end
+            RefreshCustomPresets()
+        end)
+        delB.MouseEnter:Connect(function() Tween(delB,T_FAST,{BackgroundColor3=Color3.fromRGB(255,80,80)}) end)
+        delB.MouseLeave:Connect(function() Tween(delB,T_FAST,{BackgroundColor3=C.Red}) end)
+    end
+end
+ 
+-- Add-preset inputs
+local _newPresetName = ""
+local _newPresetID   = ""
+local addNameTO = Tabs["Music"].Order + 1; Tabs["Music"].Order = addNameTO
+local addNcon = New("Frame", { Size=UDim2.new(1,0,0,56), BackgroundColor3=C.Element,
+    BorderSizePixel=0, LayoutOrder=addNameTO, Parent=customPresetScroll,
+}, { New("UICorner",{CornerRadius=UDim.new(0,7)}) })
+New("TextLabel", { Size=UDim2.new(1,-24,0,22), Position=UDim2.new(0,12,0,0),
+    BackgroundTransparency=1, Text="Preset Name", Font=Enum.Font.Gotham, TextSize=12,
+    TextColor3=C.Text, TextXAlignment=Enum.TextXAlignment.Left, ZIndex=3, Parent=addNcon })
+local addNameBox = New("TextBox", { Size=UDim2.new(1,-24,0,26), Position=UDim2.new(0,12,0,24),
+    BackgroundColor3=C.SliderBG, BorderSizePixel=0, Text="", PlaceholderText="e.g. My Song",
+    Font=Enum.Font.Gotham, TextSize=12, TextColor3=C.Text, PlaceholderColor3=C.TextMuted,
+    ClearTextOnFocus=false, ZIndex=4, Parent=addNcon,
+}, { New("UICorner",{CornerRadius=UDim.new(0,5)}), New("UIPadding",{PaddingLeft=UDim.new(0,6)}) })
+addNameBox:GetPropertyChangedSignal("Text"):Connect(function() _newPresetName = addNameBox.Text end)
+ 
+local addIDto = Tabs["Music"].Order + 1; Tabs["Music"].Order = addIDto
+local addIDcon = New("Frame", { Size=UDim2.new(1,0,0,56), BackgroundColor3=C.Element,
+    BorderSizePixel=0, LayoutOrder=addIDto, Parent=customPresetScroll,
+}, { New("UICorner",{CornerRadius=UDim.new(0,7)}) })
+New("TextLabel", { Size=UDim2.new(1,-24,0,22), Position=UDim2.new(0,12,0,0),
+    BackgroundTransparency=1, Text="Asset ID", Font=Enum.Font.Gotham, TextSize=12,
+    TextColor3=C.Text, TextXAlignment=Enum.TextXAlignment.Left, ZIndex=3, Parent=addIDcon })
+local addIDBox = New("TextBox", { Size=UDim2.new(1,-24,0,26), Position=UDim2.new(0,12,0,24),
+    BackgroundColor3=C.SliderBG, BorderSizePixel=0, Text="", PlaceholderText="numeric ID",
+    Font=Enum.Font.Gotham, TextSize=12, TextColor3=C.Text, PlaceholderColor3=C.TextMuted,
+    ClearTextOnFocus=false, ZIndex=4, Parent=addIDcon,
+}, { New("UICorner",{CornerRadius=UDim.new(0,5)}), New("UIPadding",{PaddingLeft=UDim.new(0,6)}) })
+addIDBox:GetPropertyChangedSignal("Text"):Connect(function() _newPresetID = addIDBox.Text end)
+ 
+local addBTO = Tabs["Music"].Order + 1; Tabs["Music"].Order = addBTO
+local addBtn = New("TextButton", { Size=UDim2.new(1,0,0,34), BackgroundColor3=C.Element,
+    BorderSizePixel=0, LayoutOrder=addBTO, Text="", Parent=customPresetScroll,
+}, { New("UICorner",{CornerRadius=UDim.new(0,7)}) })
+New("TextLabel", { Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text="+ Add Preset",
+    Font=Enum.Font.GothamBold, TextSize=12, TextColor3=C.On, ZIndex=3, Parent=addBtn })
+addBtn.MouseButton1Click:Connect(function()
+    local nm = _newPresetName:match("^%s*(.-)%s*$")
+    local id = _newPresetID:match("(%d+)")
+    if nm == "" or not id then PolarisNotify("Music", "Enter a name and valid asset ID.", 2); return end
+    table.insert(State.Music.CustomPresets, { name=nm, id=id })
+    addNameBox.Text = ""; _newPresetName = ""
+    addIDBox.Text   = ""; _newPresetID   = ""
+    RefreshCustomPresets()
+    PolarisNotify("Music", "Preset added: " .. nm, 2)
+end)
+addBtn.MouseEnter:Connect(function() Tween(addBtn,T_FAST,{BackgroundColor3=C.ElemHov}) end)
+addBtn.MouseLeave:Connect(function() Tween(addBtn,T_FAST,{BackgroundColor3=C.Element}) end)
+ 
+RefreshCustomPresets()
+ 
+MusicTab:CreateSection("Player")
+MusicTab:CreateTextInput({ Name="Asset ID", Placeholder="Enter numeric ID", DefaultText="",
+    Callback=function(v)
+        local id = v:match("(%d+)")
+        if id then State.Music.ID=id end
+    end })
+MusicTab:CreateSlider({ Name="Volume", Range={0,100}, Increment=1, Suffix="%", CurrentValue=50,
+    Callback=function(v) State.Music.Volume=v/100; MusicSound.Volume=State.Music.Volume end })
+MusicTab:CreateSlider({ Name="Pitch", Range={25,400}, Increment=5, Suffix="%", CurrentValue=100,
+    Callback=function(v)
+        State.Music.Pitch = v/100
+        pcall(function() MusicSound.PlaybackSpeed = State.Music.Pitch end)
+    end })
+MusicTab:CreateToggle({ Name="Loop", CurrentValue=false,
+    Callback=function(v) State.Music.Looped=v; MusicSound.Looped=v end })
+MusicTab:CreateButton({ Name="Play",
+    Callback=function()
+        PlayMusic()
+        PolarisNotify("Music", "Playing ID: " .. (State.Music.ID ~= "" and State.Music.ID or "none"), 3)
+    end })
+MusicTab:CreateButton({ Name="Stop", Callback=function() StopMusic() end })
+MusicTab:CreateLabel("Enter asset ID (numbers only). Press Play.")
+ 
+-- ── VISUALS ───────────────────────────────────────────────────
+ 
+VisualTab:CreateSection("Camera")
+VisualTab:CreateSlider({ Name="Camera FOV", Range={10,120}, Increment=1, Suffix="°", CurrentValue=70,
+    Callback=function(v) State.CameraFOV=v; GetCamera().FieldOfView=v end })
+ 
+VisualTab:CreateSection("Lighting")
+VisualTab:CreateToggle({ Name="Fullbright", CurrentValue=false,
+    Callback=function(v) State.Fullbright=v; SetupFullbright() end })
+VisualTab:CreateToggle({ Name="No Fog", CurrentValue=false,
+    Callback=function(v) State.NoFog=v; SetupNoFog() end })
+VisualTab:CreateToggle({ Name="No Shadows", CurrentValue=false,
+    Callback=function(v) State.NoShadows=v; SetupNoShadows() end })
+ 
+VisualTab:CreateSection("Performance")
+VisualTab:CreateToggle({ Name="Boost FPS", CurrentValue=false,
+    Callback=function(v) State.FPSBoost=v; SetupFPSBoost() end })
+ 
+-- ── HITBOX ────────────────────────────────────────────────────
+ 
+HitboxTab:CreateSection("Hitbox Expander")
+HitboxTab:CreateToggle({ Name="Enable Hitbox Expander", CurrentValue=false,
+    StateGet=function() return State.Hitbox.Enabled end,
+    Callback=function(v) State.Hitbox.Enabled=v; SetupHitbox() end })
+HitboxTab:CreateSlider({ Name="Expansion Size", Range={0,15}, Increment=1, Suffix=" st", CurrentValue=4,
+    StateGet=function() return State.Hitbox.Size end,
+    Callback=function(v) State.Hitbox.Size=v end })
+HitboxTab:CreateColorPicker({ Name="Highlight Color", Color=Color3.fromRGB(255,60,60),
+    NoRainbow=true,
+    Callback=function(v) State.Hitbox.Color=v end })
+HitboxTab:CreateToggle({ Name="Show Highlight on Players", CurrentValue=false,
+    StateGet=function() return State.Hitbox.Highlight end,
+    Callback=function(v) State.Hitbox.Highlight=v end })
+HitboxTab:CreateToggle({ Name="Team Check (skip teammates)", CurrentValue=true,
+    StateGet=function() return State.Hitbox.TeamCheck end,
+    Callback=function(v)
+        State.Hitbox.TeamCheck=v
+        if State.Hitbox.Enabled then ClearAllHitboxes(); SetupHitbox() end
+    end })
+ 
+HitboxTab:CreateSection("Target Parts")
+do
+    local partDefs = {
+        {"Head",              "Head"            },
+        {"Torso  (R6 / R15)", "Torso"           },  -- Torso matches R6; UpperTorso also kept in State
+        {"HumanoidRootPart",  "HumanoidRootPart"},
+        {"Right Arm",         "Right Arm"       },
+        {"Left Arm",          "Left Arm"        },
+        {"Right Leg",         "Right Leg"       },
+        {"Left Leg",          "Left Leg"        },
+    }
+    -- Also keep UpperTorso toggled together with Torso for R15
+    for _, def in ipairs(partDefs) do
+        local dn, sk = def[1], def[2]
+        HitboxTab:CreateToggle({
+            Name         = dn,
+            CurrentValue = State.Hitbox.Parts[sk] or false,
+            StateGet     = function() return State.Hitbox.Parts[sk] or false end,
+            Callback     = function(v)
+                State.Hitbox.Parts[sk] = v
+                -- Mirror Torso <-> UpperTorso so both R6 and R15 are covered
+                if sk == "Torso" then State.Hitbox.Parts["UpperTorso"] = v end
+                if State.Hitbox.Enabled then ClearAllHitboxes(); SetupHitbox() end
+            end
+        })
+    end
+end
+-- ── MISC ──────────────────────────────────────────────────────
+ 
+MiscTab:CreateSection("Combat")
+MiscTab:CreateToggle({ Name="Anti-Fling", CurrentValue=false,
+    StateGet=function() return State.AntiFling end,
+    Callback=function(v) State.AntiFling=v; SetupAntiFling() end })
+ 
+MiscTab:CreateSection("Location Finder")
+local setLocX = MiscTab:CreateDisplay({ Name="X", DefaultText="0.00" })
+local setLocY = MiscTab:CreateDisplay({ Name="Y", DefaultText="0.00" })
+local setLocZ = MiscTab:CreateDisplay({ Name="Z", DefaultText="0.00" })
+MiscTab:CreateButton({ Name="Copy Location to Clipboard",
+    Callback=function()
+        local root = GetRoot(LocalPlayer)
+        if root then
+            local p   = root.Position
+            local txt = string.format("%.2f, %.2f, %.2f", p.X, p.Y, p.Z)
+            CopyToClipboard(txt)
+            PolarisNotify("Copied", txt, 2)
+        end
+    end })
+ 
+MiscTab:CreateSection("Kill Script")
+MiscTab:CreateLabel("Completely removes Polaris from the game session.")
+MiscTab:CreateButton({ Name="⚠  Kill Script",
+    Callback=function()
+        -- 1. Stop all connections
+        for name in pairs(Connections) do Drop(name) end
+        -- 2. Restore hitboxes
+        pcall(ClearAllHitboxes)
+        -- 3. Clear ESP
+        pcall(ClearAllESP)
+        -- 4. Remove drawing objects
+        if _G._PolarisDrawings then
+            for _, d in ipairs(_G._PolarisDrawings) do pcall(function() d:Remove() end) end
+            _G._PolarisDrawings = nil
+        end
+        -- 5. Restore movement state
+        pcall(function()
+            local h = GetHumanoid(LocalPlayer)
+            if h then
+                h.WalkSpeed = Defaults.WalkSpeed
+                h.JumpPower = Defaults.JumpPower
+                h.PlatformStand = false
+                pcall(function() h.BreakJointsOnDeath = true end)
+                pcall(function() h.MaxHealth = 100; h.Health = 100 end)
+            end
+            local root = GetRoot(LocalPlayer)
+            if root then
+                local bv = root:FindFirstChild("FlyBV"); if bv then bv:Destroy() end
+                local bg = root:FindFirstChild("FlyBG"); if bg then bg:Destroy() end
+                if SpinBAV then pcall(function() SpinBAV:Destroy() end); SpinBAV = nil end
+            end
+        end)
+        -- 6. Restore lighting
+        pcall(function()
+            Lighting.Ambient        = LDefault.Ambient
+            Lighting.OutdoorAmbient = LDefault.OutdoorAmbient
+            Lighting.Brightness     = LDefault.Brightness
+            Lighting.GlobalShadows  = LDefault.GlobalShadows
+            Lighting.FogEnd         = LDefault.FogEnd
+            Lighting.FogStart       = LDefault.FogStart
+        end)
+        -- 7. Destroy GUI
+        pcall(function() ScreenGui:Destroy() end)
+        pcall(function() WatermarkGui:Destroy() end)
+        -- 8. Stop music
+        pcall(function() MusicSound:Stop(); MusicSound:Destroy() end)
+        print("[polaris.gov] script killed.")
+    end })
+ 
+MiscTab:CreateSection("Info")
+MiscTab:CreateLabel("universal | polaris.gov | v2.7.2")
+MiscTab:CreateLabel("RightAlt = toggle GUI visibility")
+ 
+MiscTab:CreateSection("Discord")
+MiscTab:CreateLabel("discord.gg/2azAG826Tm")
+MiscTab:CreateButton({ Name="Copy Discord Link",
+    Callback=function()
+        CopyToClipboard(DISCORD_LINK)
+        PolarisNotify("Discord", "Link copied to clipboard!", 2)
+    end })
+ 
+-- ── CONFIGS ───────────────────────────────────────────────────
+ 
+do
+    local cfgNameValue = ""
+    local cfgScroll    = Tabs["Configs"].Scroll
+    local cfgTabObj    = Tabs["Configs"]
+    local function NO_C() cfgTabObj.Order=cfgTabObj.Order+1; return cfgTabObj.Order end
+ 
+    -- Save/Load section header
+    local sec1 = New("Frame",{Size=UDim2.new(1,0,0,26),BackgroundTransparency=1,LayoutOrder=NO_C(),Parent=cfgScroll})
+    New("TextLabel",{Size=UDim2.fromScale(1,1),BackgroundTransparency=1,Text="SAVE / LOAD",
+        Font=Enum.Font.GothamBold,TextSize=10,TextColor3=C.Accent,
+        TextXAlignment=Enum.TextXAlignment.Left,ZIndex=3,Parent=sec1})
+    New("Frame",{Size=UDim2.new(1,0,0,1),Position=UDim2.new(0,0,1,-1),
+        BackgroundColor3=C.Border,BorderSizePixel=0,ZIndex=3,Parent=sec1})
+ 
+    -- Name input
+    local nameInputCon = New("Frame",{Size=UDim2.new(1,0,0,56),BackgroundColor3=C.Element,
+        BorderSizePixel=0,LayoutOrder=NO_C(),Parent=cfgScroll,
+    },{New("UICorner",{CornerRadius=UDim.new(0,7)})})
+    New("TextLabel",{Size=UDim2.new(1,-24,0,22),Position=UDim2.new(0,12,0,0),
+        BackgroundTransparency=1,Text="Profile Name",Font=Enum.Font.Gotham,TextSize=12,
+        TextColor3=C.Text,TextXAlignment=Enum.TextXAlignment.Left,ZIndex=3,Parent=nameInputCon})
+    local nameBox = New("TextBox",{
+        Size=UDim2.new(1,-24,0,26),Position=UDim2.new(0,12,0,24),
+        BackgroundColor3=C.SliderBG,BorderSizePixel=0,
+        Text="",PlaceholderText="e.g. my_config",
+        Font=Enum.Font.Gotham,TextSize=12,TextColor3=C.Text,
+        PlaceholderColor3=C.TextMuted,ClearTextOnFocus=false,
+        ZIndex=4,Parent=nameInputCon,
+    },{New("UICorner",{CornerRadius=UDim.new(0,5)}),New("UIPadding",{PaddingLeft=UDim.new(0,6),PaddingRight=UDim.new(0,6)})})
+    nameBox:GetPropertyChangedSignal("Text"):Connect(function() cfgNameValue=nameBox.Text end)
+    nameInputCon.MouseEnter:Connect(function() Tween(nameInputCon,T_FAST,{BackgroundColor3=C.ElemHov}) end)
+    nameInputCon.MouseLeave:Connect(function() Tween(nameInputCon,T_FAST,{BackgroundColor3=C.Element}) end)
+ 
+    -- Saved profiles header
+    local sec2 = New("Frame",{Size=UDim2.new(1,0,0,26),BackgroundTransparency=1,LayoutOrder=NO_C(),Parent=cfgScroll})
+    New("TextLabel",{Size=UDim2.fromScale(1,1),BackgroundTransparency=1,Text="SAVED PROFILES",
+        Font=Enum.Font.GothamBold,TextSize=10,TextColor3=C.Accent,
+        TextXAlignment=Enum.TextXAlignment.Left,ZIndex=3,Parent=sec2})
+    New("Frame",{Size=UDim2.new(1,0,0,1),Position=UDim2.new(0,0,1,-1),
+        BackgroundColor3=C.Border,BorderSizePixel=0,ZIndex=3,Parent=sec2})
+ 
+    -- Dynamic list container
+    local cfgListContainer = New("Frame",{
+        Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y,
+        BackgroundTransparency=1, LayoutOrder=NO_C(), Parent=cfgScroll,
+    },{New("UIListLayout",{Padding=UDim.new(0,4),SortOrder=Enum.SortOrder.LayoutOrder,FillDirection=Enum.FillDirection.Vertical})})
+ 
+    -- Status section
+    local sec3 = New("Frame",{Size=UDim2.new(1,0,0,26),BackgroundTransparency=1,LayoutOrder=NO_C(),Parent=cfgScroll})
+    New("TextLabel",{Size=UDim2.fromScale(1,1),BackgroundTransparency=1,Text="STATUS",
+        Font=Enum.Font.GothamBold,TextSize=10,TextColor3=C.Accent,
+        TextXAlignment=Enum.TextXAlignment.Left,ZIndex=3,Parent=sec3})
+    New("Frame",{Size=UDim2.new(1,0,0,1),Position=UDim2.new(0,0,1,-1),
+        BackgroundColor3=C.Border,BorderSizePixel=0,ZIndex=3,Parent=sec3})
+ 
+    local statusRow = New("Frame",{Size=UDim2.new(1,0,0,36),BackgroundColor3=C.Element,
+        BorderSizePixel=0,LayoutOrder=NO_C(),Parent=cfgScroll,
+    },{New("UICorner",{CornerRadius=UDim.new(0,7)})})
+    New("TextLabel",{Size=UDim2.new(0.4,0,1,0),Position=UDim2.new(0,12,0,0),
+        BackgroundTransparency=1,Text="Active Config",Font=Enum.Font.Gotham,TextSize=12,
+        TextColor3=C.TextDim,TextXAlignment=Enum.TextXAlignment.Left,ZIndex=3,Parent=statusRow})
+    local statusLabel = New("TextLabel",{Size=UDim2.new(0.6,-12,1,0),Position=UDim2.new(0.4,0,0,0),
+        BackgroundTransparency=1,Text="none",Font=Enum.Font.GothamBold,
+        TextSize=11,TextColor3=C.Accent,TextXAlignment=Enum.TextXAlignment.Right,ZIndex=3,Parent=statusRow})
+ 
+    -- FIX: expose via upvalue so CFGAutoLoad can update it
+    _cfgStatusLabel = statusLabel
+ 
+    New("TextLabel",{
+        Size=UDim2.new(1,0,0,32),BackgroundTransparency=1,
+        Text="Note: toggle features off/on after loading to refresh GUI visuals.",
+        Font=Enum.Font.Gotham,TextSize=10,TextColor3=C.TextMuted,
+        TextXAlignment=Enum.TextXAlignment.Left,TextWrapped=true,
+        LayoutOrder=NO_C(),ZIndex=3,Parent=cfgScroll,
+    })
+ 
+    -- Refresh the dynamic profile list
+    local function RefreshCFGList()
+        for _, child in ipairs(cfgListContainer:GetChildren()) do
+            if not child:IsA("UIListLayout") then child:Destroy() end
+        end
+        local names = CFGList()
+        if #names == 0 then
+            New("TextLabel",{
+                Size=UDim2.new(1,0,0,28),BackgroundTransparency=1,
+                Text="No saved profiles found.",Font=Enum.Font.Gotham,
+                TextSize=11,TextColor3=C.TextMuted,
+                TextXAlignment=Enum.TextXAlignment.Left,
+                LayoutOrder=1,ZIndex=3,Parent=cfgListContainer,
+            })
+            return
+        end
+        for i, name in ipairs(names) do
+            local row = New("Frame",{
+                Size=UDim2.new(1,0,0,36),BackgroundColor3=C.Element,
+                BorderSizePixel=0,LayoutOrder=i,ZIndex=3,Parent=cfgListContainer,
+            },{New("UICorner",{CornerRadius=UDim.new(0,7)})})
+            New("TextLabel",{
+                Size=UDim2.new(1,-88,1,0),Position=UDim2.new(0,10,0,0),
+                BackgroundTransparency=1,Text=name,Font=Enum.Font.Gotham,
+                TextSize=11,TextColor3=C.Text,
+                TextXAlignment=Enum.TextXAlignment.Left,ZIndex=4,Parent=row,
+            })
+            -- Load button
+            local loadB = New("TextButton",{
+                Size=UDim2.fromOffset(36,22),Position=UDim2.new(1,-80,0.5,-11),
+                BackgroundColor3=C.AccentDim,BorderSizePixel=0,
+                Text="Load",Font=Enum.Font.GothamBold,TextSize=9,
+                TextColor3=C.White,ZIndex=4,Parent=row,
+            },{New("UICorner",{CornerRadius=UDim.new(0,5)})})
+            loadB.MouseButton1Click:Connect(function()
+                local ok, msg = CFGLoad(name)
+                if ok then
+                    statusLabel.Text = name
+                    PolarisNotify("Config","Loaded: "..name,3)
+                else
+                    PolarisNotify("Config","Load failed: "..(msg or "?"),3)
+                end
+            end)
+            loadB.MouseEnter:Connect(function() Tween(loadB,T_FAST,{BackgroundColor3=C.Accent}) end)
+            loadB.MouseLeave:Connect(function() Tween(loadB,T_FAST,{BackgroundColor3=C.AccentDim}) end)
+            -- Delete button
+            local delB = New("TextButton",{
+                Size=UDim2.fromOffset(36,22),Position=UDim2.new(1,-40,0.5,-11),
+                BackgroundColor3=C.Red,BorderSizePixel=0,
+                Text="Del",Font=Enum.Font.GothamBold,TextSize=9,
+                TextColor3=C.White,ZIndex=4,Parent=row,
+            },{New("UICorner",{CornerRadius=UDim.new(0,5)})})
+            delB.MouseButton1Click:Connect(function()
+                CFGDelete(name)
+                -- Clear status if it was showing the deleted config
+                if statusLabel.Text == name then statusLabel.Text = "none" end
+                PolarisNotify("Config","Deleted: "..name,2)
+                RefreshCFGList()
+            end)
+            delB.MouseEnter:Connect(function() Tween(delB,T_FAST,{BackgroundColor3=Color3.fromRGB(255,80,80)}) end)
+            delB.MouseLeave:Connect(function() Tween(delB,T_FAST,{BackgroundColor3=C.Red}) end)
+        end
+    end
+ 
+    -- Save button
+    local saveBtn = New("TextButton",{
+        Size=UDim2.new(1,0,0,34),BackgroundColor3=C.Element,
+        BorderSizePixel=0,LayoutOrder=NO_C(),Text="",Parent=cfgScroll,
+    },{New("UICorner",{CornerRadius=UDim.new(0,7)})})
+    New("TextLabel",{Size=UDim2.fromScale(1,1),BackgroundTransparency=1,Text="Save Current Config",
+        Font=Enum.Font.GothamBold,TextSize=12,TextColor3=C.Accent,ZIndex=3,Parent=saveBtn})
+    saveBtn.MouseButton1Click:Connect(function()
+        local name = cfgNameValue:gsub("^%s+",""):gsub("%s+$","")
+        if name == "" then PolarisNotify("Config","Enter a profile name first.",2); return end
+        local ok, msg = CFGSave(name)
+        if ok then
+            statusLabel.Text = name
+            PolarisNotify("Config","Saved: "..name,3)
+            RefreshCFGList()
+        else
+            PolarisNotify("Config","Save failed: "..(msg or "?"),3)
+        end
+    end)
+    saveBtn.MouseEnter:Connect(function() Tween(saveBtn,T_FAST,{BackgroundColor3=C.ElemHov}) end)
+    saveBtn.MouseLeave:Connect(function() Tween(saveBtn,T_FAST,{BackgroundColor3=C.Element}) end)
+ 
+    -- Refresh button
+    local refreshBtn = New("TextButton",{
+        Size=UDim2.new(1,0,0,34),BackgroundColor3=C.Element,
+        BorderSizePixel=0,LayoutOrder=NO_C(),Text="",Parent=cfgScroll,
+    },{New("UICorner",{CornerRadius=UDim.new(0,7)})})
+    New("TextLabel",{Size=UDim2.fromScale(1,1),BackgroundTransparency=1,Text="Refresh Profile List",
+        Font=Enum.Font.GothamBold,TextSize=12,TextColor3=C.TextDim,ZIndex=3,Parent=refreshBtn})
+    refreshBtn.MouseButton1Click:Connect(function()
+        RefreshCFGList()
+        PolarisNotify("Config","List refreshed.",1.5)
+    end)
+    refreshBtn.MouseEnter:Connect(function() Tween(refreshBtn,T_FAST,{BackgroundColor3=C.ElemHov}) end)
+    refreshBtn.MouseLeave:Connect(function() Tween(refreshBtn,T_FAST,{BackgroundColor3=C.Element}) end)
+ 
+    RefreshCFGList()
+end
+ 
+-- ============================================================
+-- // OPEN DEFAULT TAB
+-- ============================================================
+ 
+SwitchTab("Aimbot")
+ 
+MainFrame.InputBegan:Connect(function(inp)
+    if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+        local mp = UserInputService:GetMouseLocation()
+        if not PointInAnyPopup(mp.X, mp.Y) then CloseAllPopups() end
+    end
+end)
+ 
+-- ============================================================
+-- // SHARED SLIDER INPUT TRACKER
+-- ============================================================
+-- _activeSlide is declared near the top (in MISC STORAGE) so slider
+-- callbacks and these listeners share the same upvalue.
+-- These two listeners complete the slider drag/release logic.
+ 
+UserInputService.InputChanged:Connect(function(inp)
+    if not _activeSlide then return end
+    if inp.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+    local trk = _activeSlide.trk
+    if not trk or not trk.Parent then _activeSlide = nil; return end
+    _activeSlide.sv((inp.Position.X - trk.AbsolutePosition.X) / trk.AbsoluteSize.X)
+end)
+ 
+UserInputService.InputEnded:Connect(function(inp)
+    if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+        _activeSlide = nil
+    end
+end)
+ 
+-- ============================================================
+-- // FOV CIRCLE  (follows mouse cursor)
+-- ============================================================
+ 
+local FOV_SEGS = 64
+local FOVLines = {}
+local TWO_PI   = math.pi * 2
+ 
+for i = 1, FOV_SEGS do
+    local ln     = Drawing.new("Line")
+    ln.Visible   = false
+    ln.Color     = State.Aimbot.Color
+    ln.Thickness = 1
+    FOVLines[i]  = ln
+end
+local _fovVis = false
+local _fovR   = -1
+local _fovCX  = -1
+local _fovCY  = -1
+local _fovCol = State.Aimbot.Color
+ 
+local function UpdateFOVCircle(col, vis)
+    if not vis then
+        if _fovVis then
+            for i=1,FOV_SEGS do FOVLines[i].Visible=false end
+            _fovVis = false
+        end
+        return
+    end
+    local mp = UserInputService:GetMouseLocation()
+    local cx, cy, r = mp.X, mp.Y, State.Aimbot.FOV
+    local pc = cx~=_fovCX or cy~=_fovCY or r~=_fovR
+    local cc = col~=_fovCol
+    _fovVis=true; _fovCX=cx; _fovCY=cy; _fovR=r; _fovCol=col
+    for i=1,FOV_SEGS do
+        local ln=FOVLines[i]
+        if pc then
+            local a1=(i-1)/FOV_SEGS*TWO_PI
+            local a2=i    /FOV_SEGS*TWO_PI
+            ln.From=Vector2.new(cx+math.cos(a1)*r, cy+math.sin(a1)*r)
+            ln.To  =Vector2.new(cx+math.cos(a2)*r, cy+math.sin(a2)*r)
+        end
+        if cc then ln.Color=col end
+        if not ln.Visible then ln.Visible=true end
+    end
+end
+ 
+-- ============================================================
+-- // TRIGGERBOT CROSSHAIR  (viewport center)
+-- ============================================================
+ 
+local TBCircle         = Drawing.new("Circle")
+TBCircle.Visible       = false
+TBCircle.Color         = Color3.fromRGB(255, 255, 255)
+TBCircle.Thickness     = 1
+TBCircle.NumSides      = 40
+TBCircle.Filled        = false
+ 
+local TBCrossH         = Drawing.new("Line")
+TBCrossH.Visible       = false
+TBCrossH.Color         = Color3.fromRGB(255, 255, 255)
+TBCrossH.Thickness     = 1
+ 
+local TBCrossV         = Drawing.new("Line")
+TBCrossV.Visible       = false
+TBCrossV.Color         = Color3.fromRGB(255, 255, 255)
+TBCrossV.Thickness     = 1
+ 
+local TBDot            = Drawing.new("Circle")
+TBDot.Visible          = false
+TBDot.Color            = Color3.fromRGB(255, 255, 255)
+TBDot.Thickness        = 1
+TBDot.Radius           = 2
+TBDot.NumSides         = 12
+TBDot.Filled           = true
+ 
+-- FIX: Register all Drawing objects so re-injection can clean them up.
+do
+    local reg = {}
+    for _, ln in ipairs(FOVLines) do table.insert(reg, ln) end
+    table.insert(reg, TBCircle)
+    table.insert(reg, TBCrossH)
+    table.insert(reg, TBCrossV)
+    table.insert(reg, TBDot)
+    _G._PolarisDrawings = reg
+end
+ 
+local function UpdateTBCrosshair()
+    if not State.Triggerbot.Enabled then
+        TBCircle.Visible = false
+        TBCrossH.Visible = false
+        TBCrossV.Visible = false
+        TBDot.Visible    = false
+        return
+    end
+    local cx, cy = _vpCenter.X, _vpCenter.Y
+    local r      = State.Triggerbot.Radius
+    local csz    = 8   -- half-length of crosshair tick marks
+ 
+    TBCircle.Position = Vector2.new(cx, cy)
+    TBCircle.Radius   = r
+    TBCircle.Visible  = true
+ 
+    TBCrossH.From    = Vector2.new(cx - csz, cy)
+    TBCrossH.To      = Vector2.new(cx + csz, cy)
+    TBCrossH.Visible = true
+ 
+    TBCrossV.From    = Vector2.new(cx, cy - csz)
+    TBCrossV.To      = Vector2.new(cx, cy + csz)
+    TBCrossV.Visible = true
+ 
+    TBDot.Position = Vector2.new(cx, cy)
+    TBDot.Visible  = true
+end
+ 
+-- ============================================================
+-- // MAIN RENDER LOOP
+-- ============================================================
+ 
+Conn("RenderMain", RunService.RenderStepped:Connect(function(dt)
+    -- 1. Viewport center
+    local cam = GetCamera()
+    _vpCenter = Vector2.new(cam.ViewportSize.X * 0.5, cam.ViewportSize.Y * 0.5)
+ 
+    -- 2. Rainbow hues (independent speeds for aimbot vs ESP)
+    _rainbowHueAimbot = (_rainbowHueAimbot + dt * State.Aimbot.RainbowSpeed) % 1
+    _rainbowHueESP    = (_rainbowHueESP    + dt * State.ESP.RainbowSpeed)    % 1
+    local rainbowColAimbot = Color3.fromHSV(_rainbowHueAimbot, 1, 1)
+    local rainbowColESP    = Color3.fromHSV(_rainbowHueESP,    1, 1)
+ 
+    -- 3. FOV circle
+    local fovCol = State.Aimbot.RainbowFOV and rainbowColAimbot or State.Aimbot.Color
+    UpdateFOVCircle(fovCol, State.Aimbot.Enabled)
+ 
+    -- 4. Triggerbot crosshair
+    UpdateTBCrosshair()
+ 
+    -- 5. Aimbot
+    if State.Aimbot.Enabled then RunAimbot() end
+ 
+    -- 6. Triggerbot
+    RunTriggerbot(dt)
+ 
+    -- 7. ESP
+    UpdateESP(rainbowColESP)
+ 
+    -- 8. FPS / watermark update (every 0.5 s)
+    _fpsCount = _fpsCount + 1
+    _fpsAccum = _fpsAccum + dt
+    _wmAccum  = _wmAccum  + dt
+    if _wmAccum >= 0.5 then
+        if _fpsAccum > 0 then
+            _fpsCached = math.floor(_fpsCount / _fpsAccum + 0.5)
+        end
+        _fpsCount = 0; _fpsAccum = 0; _wmAccum = 0
+        local ping = math.floor(LocalPlayer:GetNetworkPing() * 1000)
+        WatermarkLabel.Text = string.format("polaris.gov  |  %d fps  |  %d ms", _fpsCached, ping)
+    end
+end))
+ 
+-- Location display
+Conn("LocUpdate", RunService.Heartbeat:Connect(function()
+    local root = GetRoot(LocalPlayer)
+    if root then
+        local p = root.Position
+        setLocX(string.format("%.2f", p.X))
+        setLocY(string.format("%.2f", p.Y))
+        setLocZ(string.format("%.2f", p.Z))
+    end
+end))
+ 
+-- ============================================================
+-- // PLAYER & CHARACTER EVENTS
+-- ============================================================
+ 
+Players.PlayerAdded:Connect(function(player)
+    if State.ESP.Enabled then CreateESPForPlayer(player) end
+ 
+    -- FIX: always register CharacterAdded regardless of Hitbox state;
+    -- the hitbox check happens inside the callback so future enables work correctly.
+    player.CharacterAdded:Connect(function()
+        task.wait(0.5)
+        -- ESP rebuild
+        if State.ESP.Enabled then
+            local d = ESPObjects[player]
+            if d then
+                -- Trigger skeleton rebuild on next update frame
+                d.lastChar = nil
+            end
+        end
+        -- Hitbox rebuild
+        RemoveHitboxForPlayer(player)
+        if State.Hitbox.Enabled then BuildHitboxForPlayer(player) end
+    end)
+ 
+    -- Build hitbox for current character if already spawned
+    if State.Hitbox.Enabled and player.Character then
+        BuildHitboxForPlayer(player)
+    end
+end)
+ 
+Players.PlayerRemoving:Connect(function(player)
+    local d = ESPObjects[player]
+    if d then DestroyESPEntry(d); ESPObjects[player] = nil end
+    RemoveHitboxForPlayer(player)
+end)
+ 
+Mouse.Button1Down:Connect(function()
+    local root = GetRoot(LocalPlayer); if not root then return end
+    if State.Movement.ClickTP then
+        root.CFrame = CFrame.new(Mouse.Hit.Position + Vector3.new(0,3,0))
+    elseif State.Movement.ClickTweenTP and not TweenTPActive then
+        TweenTPActive = true
+        local tgt  = Mouse.Hit.Position + Vector3.new(0,3,0)
+        local dist = (tgt - root.Position).Magnitude
+        local tt   = math.max(0.05, dist / (State.Movement.ClickTweenTPSpeed * 20))
+        local tw   = TweenService:Create(root,
+            TweenInfo.new(tt, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            { CFrame = CFrame.new(tgt) })
+        root.Anchored = true
+        tw:Play()
+        tw.Completed:Connect(function() root.Anchored=false; TweenTPActive=false end)
+    end
+end)
+ 
+LocalPlayer.CharacterAdded:Connect(OnCharacterAdded)
+ 
+-- ============================================================
+-- // STARTUP
+-- ============================================================
+ 
+local _openSound        = Instance.new("Sound")
+_openSound.Name         = "PolarisOpen"
+_openSound.SoundId      = "rbxassetid://140528689236462"
+_openSound.Volume       = 1
+_openSound.Looped       = false
+_openSound.Parent       = SoundService
+_openSound:Play()
+game:GetService("Debris"):AddItem(_openSound, 30)
+ 
+-- ============================================================
+-- // LOADING SCREEN
+-- ============================================================
+ 
+do
+    local ls = New("Frame", {
+        Size=UDim2.fromScale(1,1), BackgroundColor3=Color3.fromRGB(8,8,14),
+        ZIndex=999, Parent=ScreenGui,
+    })
+    local logoLabel = New("TextLabel", {
+        Size=UDim2.new(1,0,0,48), Position=UDim2.new(0,0,0.38,0),
+        BackgroundTransparency=1, Text="polaris.gov",
+        Font=Enum.Font.GothamBold, TextSize=36, TextColor3=C.Accent,
+        TextXAlignment=Enum.TextXAlignment.Center, ZIndex=1000, Parent=ls,
+    })
+    local subLabel = New("TextLabel", {
+        Size=UDim2.new(1,0,0,28), Position=UDim2.new(0,0,0.38,52),
+        BackgroundTransparency=1,
+        Text="Welcome, " .. LocalPlayer.DisplayName .. "  ·  universal v2.7.2",
+        Font=Enum.Font.Gotham, TextSize=14, TextColor3=C.TextDim,
+        TextXAlignment=Enum.TextXAlignment.Center, ZIndex=1000, Parent=ls,
+    })
+    local barBG = New("Frame", {
+        Size=UDim2.fromOffset(260,3), Position=UDim2.new(0.5,-130,0.38,92),
+        BackgroundColor3=C.SliderBG, BorderSizePixel=0, ZIndex=1000, Parent=ls,
+    }, { New("UICorner",{CornerRadius=UDim.new(1,0)}) })
+    local barFil = New("Frame", {
+        Size=UDim2.fromOffset(0,3), BackgroundColor3=C.Accent,
+        BorderSizePixel=0, ZIndex=1001, Parent=barBG,
+    }, { New("UICorner",{CornerRadius=UDim.new(1,0)}) })
+    -- Animate bar fill over 4.5s then fade out
+    Tween(barFil, TweenInfo.new(4.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        { Size=UDim2.fromOffset(260,3) })
+    task.delay(5.0, function()
+        local fadeInfo = TweenInfo.new(0.6, Enum.EasingStyle.Quad)
+        Tween(ls, fadeInfo, {BackgroundTransparency=1})
+        for _, c in ipairs(ls:GetDescendants()) do
+            if c:IsA("TextLabel") then Tween(c, fadeInfo, {TextTransparency=1}) end
+            if c:IsA("Frame")     then Tween(c, fadeInfo, {BackgroundTransparency=1}) end
+        end
+        task.wait(0.7)
+        if ls and ls.Parent then ls:Destroy() end
+    end)
+end
+ 
+-- ============================================================
+-- // FINAL STARTUP
+-- ============================================================
+ 
+PolarisNotify("polaris.gov", "universal v2.7.2 loaded", 4)
+print("[polaris.gov] universal v2.7.2 loaded")
+ 
+-- Autoload DISABLED (v2.7). Users load configs manually via the Configs tab.
+-- task.delay(0.5, CFGAutoLoad)  -- kept as comment for reference
