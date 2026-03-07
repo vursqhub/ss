@@ -1,7 +1,16 @@
 -- // universal | polaris.gov
--- // Version: 2.7.1
+-- // Version: 2.7.3
 -- ============================================================
--- CHANGELOG vs 2.7.0:
+-- CHANGELOG vs 2.7.2:
+--   FIX  HITBOX: Removed WeldConstraint entirely. WeldConstraint was forcing
+--         the physics engine to treat ghost parts as rigid bodies attached to
+--         character limbs, which fought the animation system and froze players.
+--         Ghost parts are now Anchored=true, parented to workspace, and have
+--         their CFrame synced to the original part every Heartbeat frame.
+--         CanQuery=true is preserved so raycasts still hit the expanded ghost.
+--   CHG  WATERMARK: Version number now displayed in the top-right fps label.
+-- ============================================================
+-- CHANGELOG vs 2.7.1:
 --   FIX  HITBOX: Reverted direct-resize approach (caused frozen visuals by
 --         breaking Motor6D joint offsets). Back to ghost-part strategy:
 --         a WeldConstraint-attached SmoothPlastic part with CanQuery=true
@@ -13,39 +22,11 @@
 --         with a "Copy Link" button.
 --   CHG  LOADING SCREEN: Extended to 5 seconds.
 -- ============================================================
--- CHANGELOG vs 2.6.2:
---   FIX  SLIDER: _activeSlide was declared after CreateTab, making slider
---         callbacks write to a different variable than the InputService
---         listeners read from. Moved declaration before CreateTab.
---   FIX  HITBOX: Revamped to directly resize original character parts for
---         genuine hit-expansion in client-side detection games. Team-check
---         added; cosmetic visual uses SmoothPlastic + optional Highlight.
---         Parts list simplified to 7 canonical parts.
---   FIX  ESP:   Highlight was parented to character BEFORE the distance
---         check, so out-of-range players still had a highlight. Moved
---         Highlight logic after distance / on-screen guard.
---   FIX  GODMODE: Added Heartbeat loop so health is continuously restored;
---         BreakJointsOnDeath set to false.
---   FIX  RAYCAST: Wall-checks now march past CanCollide=false objects
---         instead of treating them as solid walls.
---   ADD  AIMBOT: Selectable target body part (Head/Torso/HRP/Arms/Legs).
---   ADD  AIMBOT: Notifies who is being tracked and live damage counter.
---   ADD  HITBOX: Team-check ignores teammates.
---   ADD  MISC:   Kill-script button (full cleanup + GUI destroy).
---   ADD  MUSIC:  Custom user presets saved with configs.
---   ADD  LOADING SCREEN: Welcomes the local player on inject.
---   ADD  COLOR PICKER: Rainbow toggle embedded in color picker rows.
---   ADD  CONFIG: GUI controls sync visually when a config is loaded.
---   CHG  CONFIG: Autoload on startup is DISABLED; user must load manually.
--- ============================================================
- 
+
 -- ============================================================
 -- // RE-INJECTION CLEANUP
 -- ============================================================
--- Destroy any previous instance of the script so re-injecting
--- doesn't leave ghost GUIs, Drawing objects, or stale sounds.
 do
-    -- 1. Destroy old ScreenGui instances
     local _cgOk2, _cg2 = pcall(function() return game:GetService("CoreGui") end)
     local _root = (_cgOk2 and _cg2) and _cg2 or game:GetService("Players").LocalPlayer:FindFirstChild("PlayerGui")
     if _root then
@@ -54,7 +35,6 @@ do
             if old then old:Destroy() end
         end
     end
-    -- Also clean up PlayerGui copy just in case
     local pg = game:GetService("Players").LocalPlayer:FindFirstChild("PlayerGui")
     if pg then
         for _, name in ipairs({"PolarisGUI","PolarisWatermark"}) do
@@ -62,26 +42,30 @@ do
             if old then old:Destroy() end
         end
     end
- 
-    -- 2. FIX: Destroy old Drawing objects (FOV circle + TB crosshair).
-    --    Previous run stores them in _G._PolarisDrawings.
+
     if _G._PolarisDrawings then
         for _, d in ipairs(_G._PolarisDrawings) do
             pcall(function() d:Remove() end)
         end
         _G._PolarisDrawings = nil
     end
- 
-    -- 3. FIX: Destroy old PolarisMusic sound so re-injection doesn't duplicate it.
+
+    -- FIX: also destroy any leftover workspace ghost parts from previous injection
+    for _, v in ipairs(workspace:GetChildren()) do
+        if v.Name and v.Name:sub(1, 11) == "PolarisHBX_" then
+            pcall(function() v:Destroy() end)
+        end
+    end
+
     local _ss = game:GetService("SoundService")
     local _oldMusic = _ss:FindFirstChild("PolarisMusic")
     if _oldMusic then _oldMusic:Destroy() end
 end
- 
+
 -- ============================================================
 -- // SERVICES
 -- ============================================================
- 
+
 local Players          = game:GetService("Players")
 local RunService       = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -89,47 +73,36 @@ local TweenService     = game:GetService("TweenService")
 local Lighting         = game:GetService("Lighting")
 local SoundService     = game:GetService("SoundService")
 local HttpService      = game:GetService("HttpService")
- 
+
 local LocalPlayer = Players.LocalPlayer
 local Mouse       = LocalPlayer:GetMouse()
--- NOTE: 'Camera' intentionally omitted — script always calls GetCamera() to
---       pick up the current camera reference rather than caching a stale one.
- 
+
 -- ============================================================
 -- // HELPERS
 -- ============================================================
- 
+
 local function GetCamera()  return workspace.CurrentCamera end
- 
 local function GetCharacter(p) return p and p.Character end
- 
 local function GetRoot(p)
     local c = GetCharacter(p)
     return c and c:FindFirstChild("HumanoidRootPart")
 end
- 
 local function GetHumanoid(p)
     local c = GetCharacter(p)
     return c and c:FindFirstChildOfClass("Humanoid")
 end
- 
 local function IsAlive(p)
     local h = GetHumanoid(p)
     return h ~= nil and h.Health > 0
 end
- 
--- Returns true when both players are on the same non-nil Roblox Team
 local function IsTeammate(player)
     if not LocalPlayer.Team then return false end
     return player.Team ~= nil and player.Team == LocalPlayer.Team
 end
- 
--- viewport-space screen position + on-screen bool
 local function W2S(pos)
     local v, on = GetCamera():WorldToViewportPoint(pos)
     return Vector2.new(v.X, v.Y), on
 end
- 
 local function CopyToClipboard(text)
     if setclipboard then
         setclipboard(text)
@@ -137,23 +110,22 @@ local function CopyToClipboard(text)
         Clipboard.set(text)
     end
 end
- 
+
 -- ============================================================
 -- // DEFAULTS
 -- ============================================================
- 
+
 local Defaults = { WalkSpeed = 16, JumpPower = 50 }
- 
 local function RefreshDefaults()
     local h = GetHumanoid(LocalPlayer)
     if h then Defaults.WalkSpeed = h.WalkSpeed; Defaults.JumpPower = h.JumpPower end
 end
 RefreshDefaults()
- 
+
 -- ============================================================
 -- // LIGHTING DEFAULTS
 -- ============================================================
- 
+
 local LDefault = {
     Ambient        = Lighting.Ambient,
     OutdoorAmbient = Lighting.OutdoorAmbient,
@@ -164,7 +136,7 @@ local LDefault = {
 }
 local AtmoDefault  = {}
 local PostFXSaved  = {}
- 
+
 local _ia = Lighting:FindFirstChildOfClass("Atmosphere")
 if _ia then
     pcall(function() AtmoDefault.Density  = _ia.Density  end)
@@ -175,11 +147,11 @@ end
 for _, fx in ipairs(Lighting:GetChildren()) do
     if fx:IsA("PostEffect") then PostFXSaved[fx] = fx.Enabled end
 end
- 
+
 -- ============================================================
 -- // STATE
 -- ============================================================
- 
+
 local State = {
     Aimbot = {
         Enabled            = false,
@@ -194,7 +166,7 @@ local State = {
         TeamCheck          = false,
         RainbowFOV         = false,
         RainbowSpeed       = 0.4,
-        TargetPart         = "Head",   -- selectable aim bone
+        TargetPart         = "Head",
     },
     ESP = {
         Enabled      = false,
@@ -206,7 +178,7 @@ local State = {
         Tracer       = false,
         Color        = Color3.fromRGB(255, 255, 255),
         Rainbow      = false,
-        RainbowSpeed = 0.4,         -- hue units/sec
+        RainbowSpeed = 0.4,
         TeamCheck    = false,
         TeamMode     = "hide",
         TeamColor    = Color3.fromRGB(0, 255, 120),
@@ -242,7 +214,7 @@ local State = {
         Pitch         = 1,
         Looped        = false,
         Playing       = false,
-        CustomPresets = {},   -- {name=str, id=str}
+        CustomPresets = {},
     },
     CameraFOV  = 70,
     Fullbright = false,
@@ -253,8 +225,8 @@ local State = {
     Triggerbot = {
         Enabled   = false,
         Spam      = false,
-        WallCheck = false,   -- fully independent of Aimbot.WallCheck
-        TeamCheck = false,   -- fully independent of Aimbot.TeamCheck
+        WallCheck = false,
+        TeamCheck = false,
         Radius    = 15,
         Delay     = 0.08,
     },
@@ -266,8 +238,8 @@ local State = {
         TeamCheck    = true,
         Parts = {
             Head             = true,
-            Torso            = true,   -- R6
-            UpperTorso       = true,   -- R15
+            Torso            = true,
+            UpperTorso       = true,
             HumanoidRootPart = false,
             ["Right Arm"]    = false,
             ["Left Arm"]     = false,
@@ -276,64 +248,54 @@ local State = {
         },
     },
 }
- 
+
 -- ============================================================
 -- // CONNECTION MANAGER
 -- ============================================================
- 
+
 local Connections = {}
- 
 local function Conn(name, c)
     if Connections[name] then Connections[name]:Disconnect() end
     Connections[name] = c
 end
- 
 local function Drop(name)
     if Connections[name] then
         Connections[name]:Disconnect()
         Connections[name] = nil
     end
 end
- 
+
 -- ============================================================
 -- // MISC STORAGE
 -- ============================================================
- 
+
 local ESPObjects    = {}
 local TweenTPActive = false
 local LockedTarget  = nil
 local NoclipParts   = {}
- 
+
 local _vpCenter = Vector2.new(800, 450)
- 
+
 local OrbitTarget    = nil
 local OrbitAngle     = 0
 local OrbitAutoTimer = 0
- 
+
 local FPSParticleCache = {}
- 
--- Separate rainbow hues: aimbot and ESP are independent
+
 local _rainbowHueAimbot = 0
 local _rainbowHueESP    = 0
- 
--- Triggerbot scan state
+
 local _tbWasInView = false
 local _tbSpamTimer = 0
- 
--- FIX SLIDER: must be declared here (before CreateTab closures capture it)
--- so the MouseButton1Down callbacks and the InputService listeners share the
--- SAME upvalue.  Previously it was declared after the tab-building block,
--- meaning slider callbacks wrote to an inaccessible upvalue while the
--- InputService listeners read a different one — sliders never moved.
+
+-- FIX SLIDER: declared before CreateTab so callbacks and listeners share the same upvalue
 local _activeSlide = nil
- 
--- Damage tracking for aimbot notification
+
 local _lastTargetName   = ""
 local _lastTargetHP     = nil
 local _totalDamage      = 0
- 
--- GUI setter registry: allows config loads to update visual widgets
-local GUISetters = {}   -- { get=fn, set=fn }
+
+local GUISetters = {}
 local function RegisterSetter(getter, setter)
     table.insert(GUISetters, { get=getter, set=setter })
 end
@@ -342,75 +304,65 @@ local function SyncGUI()
         pcall(function() e.set(e.get()) end)
     end
 end
- 
+
 -- ============================================================
 -- // AIMBOT ENGINE
 -- ============================================================
- 
--- Raw raycast: returns true if targetPart is unobstructed from local head.
--- FIX: Marches through CanCollide=false objects (decals, triggers, etc.)
---      so transparent/non-solid map geometry doesn't count as a wall.
+
 local function RaycastVisible(targetPart)
     local char = GetCharacter(LocalPlayer)
     local head = char and char:FindFirstChild("Head")
     if not head then return false end
- 
+
     local origin    = head.Position
     local targetPos = targetPart.Position
     local direction = targetPos - origin
     local distance  = direction.Magnitude
     if distance < 0.1 then return true end
     local dirUnit   = direction.Unit
- 
+
     local excluded = { char }
     local traveled = 0
-    local MAX_ITER = 20   -- safety cap
- 
+    local MAX_ITER = 20
+
     for _ = 1, MAX_ITER do
         local rp = RaycastParams.new()
         rp.FilterDescendantsInstances = excluded
         rp.FilterType                 = Enum.RaycastFilterType.Exclude
         local res = workspace:Raycast(origin + dirUnit * traveled,
                                       dirUnit * (distance - traveled), rp)
-        if not res then
-            return true   -- clear line to target
-        end
+        if not res then return true end
         local hit = res.Instance
-        -- Skip objects that have no collision (triggers, decorations, etc.)
         if not hit.CanCollide then
             table.insert(excluded, hit)
             traveled = (res.Position - origin).Magnitude + 0.05
             if traveled >= distance then return true end
         elseif hit:IsDescendantOf(targetPart.Parent) then
-            return true   -- hit the target character itself
+            return true
         else
-            return false  -- solid obstacle
+            return false
         end
     end
     return false
 end
- 
--- Aimbot-specific visibility gate
+
 local function IsTargetVisible(targetPart)
     if not State.Aimbot.WallCheck then return true end
     return RaycastVisible(targetPart)
 end
- 
+
 local function GetPredPos(part, rootPart)
     local vel  = (State.Aimbot.Prediction and rootPart)
         and rootPart.AssemblyLinearVelocity or Vector3.zero
     local lead = State.Aimbot.Prediction and State.Aimbot.PredictionStrength or 0
     return part.Position + vel * lead
 end
- 
--- Returns the target body part for the given character based on State.Aimbot.TargetPart
+
 local function GetAimPart(char)
     if not char then return nil end
     local partName = State.Aimbot.TargetPart or "Head"
-    -- Try exact name first
     local p = char:FindFirstChild(partName)
     if p and p:IsA("BasePart") then return p end
-    -- Fallback chain for rig differences
     if partName == "Torso" then
         return char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
     elseif partName == "Head" then
@@ -418,7 +370,7 @@ local function GetAimPart(char)
     end
     return char:FindFirstChild("HumanoidRootPart")
 end
- 
+
 local function GetTargetSP(player, keepLocked)
     if not player or not IsAlive(player) then return nil end
     if State.Aimbot.TeamCheck and IsTeammate(player) then return nil end
@@ -426,20 +378,20 @@ local function GetTargetSP(player, keepLocked)
     local aimPart = GetAimPart(char)
     local root    = char and char:FindFirstChild("HumanoidRootPart")
     if not aimPart then return nil end
- 
+
     local pred    = GetPredPos(aimPart, root)
     local sp, on  = W2S(pred)
     if not on then return nil end
- 
+
     if not keepLocked then
         local mousePos = UserInputService:GetMouseLocation()
         if (sp - mousePos).Magnitude > State.Aimbot.FOV then return nil end
     end
- 
+
     if not IsTargetVisible(aimPart) then return nil end
     return sp
 end
- 
+
 local function AimScanTarget()
     local mousePos       = UserInputService:GetMouseLocation()
     local best, bestDist = nil, math.huge
@@ -463,7 +415,7 @@ local function AimScanTarget()
     end
     return best
 end
- 
+
 local function IsAimKeyActive()
     local k = State.Aimbot.LockKey
     if k == "MouseButton2" then
@@ -478,24 +430,25 @@ local function IsAimKeyActive()
     end
     return false
 end
- 
+
+local PolarisNotify  -- forward declaration
+
 local function RunAimbot()
     if not State.Aimbot.Enabled then return end
- 
+
     local keyHeld = IsAimKeyActive()
     if not keyHeld then
         LockedTarget = nil
         _lastTargetName = ""; _lastTargetHP = nil; _totalDamage = 0
         return
     end
- 
+
     local stayLocked = State.Aimbot.KeepLocked
     local sp = GetTargetSP(LockedTarget, stayLocked)
     if not sp then
         LockedTarget = AimScanTarget()
         if LockedTarget then
             sp = GetTargetSP(LockedTarget, false)
-            -- Notify on new lock
             if LockedTarget then
                 local name = LockedTarget.DisplayName or LockedTarget.Name
                 if name ~= _lastTargetName then
@@ -508,8 +461,7 @@ local function RunAimbot()
         end
     end
     if not LockedTarget or not sp then return end
- 
-    -- Damage tracking
+
     local hum = GetHumanoid(LockedTarget)
     if hum then
         local curHP = hum.Health
@@ -520,12 +472,12 @@ local function RunAimbot()
         end
         _lastTargetHP = curHP
     end
- 
+
     local char    = GetCharacter(LockedTarget)
     local aimPart = GetAimPart(char)
     local root    = char and char:FindFirstChild("HumanoidRootPart")
     if not aimPart then LockedTarget = nil; return end
- 
+
     local aimPos  = GetPredPos(aimPart, root)
     local smooth  = math.clamp(State.Aimbot.Smoothness, 0.01, 1)
     local camCF   = GetCamera().CFrame
@@ -533,15 +485,15 @@ local function RunAimbot()
     local tgtCF   = CFrame.new(camCF.Position, camCF.Position + dir)
     GetCamera().CFrame = camCF:Lerp(tgtCF, smooth)
 end
- 
+
 local function SetupAimbot()
     LockedTarget = nil
 end
- 
+
 -- ============================================================
 -- // ESP
 -- ============================================================
- 
+
 local function GetSkelPairs(char)
     if char:FindFirstChild("UpperTorso") then
         return {
@@ -560,7 +512,7 @@ local function GetSkelPairs(char)
         }
     end
 end
- 
+
 local function RebuildSkeleton(d, char)
     for _, s in ipairs(d.Skeleton) do pcall(function() s.line:Remove() end) end
     d.Skeleton = {}
@@ -573,7 +525,7 @@ local function RebuildSkeleton(d, char)
         table.insert(d.Skeleton, { line = ln, parts = pair })
     end
 end
- 
+
 local function ClearESPEntry(d)
     pcall(function() d.Box.Visible       = false end)
     pcall(function() d.Name.Visible      = false end)
@@ -583,7 +535,7 @@ local function ClearESPEntry(d)
     pcall(function() if d.Highlight.Parent ~= nil then d.Highlight.Parent = nil end end)
     for _, s in ipairs(d.Skeleton) do pcall(function() s.line.Visible = false end) end
 end
- 
+
 local function DestroyESPEntry(d)
     ClearESPEntry(d)
     pcall(function() d.Box:Remove()       end)
@@ -594,49 +546,49 @@ local function DestroyESPEntry(d)
     pcall(function() d.Highlight:Destroy() end)
     for _, s in ipairs(d.Skeleton) do pcall(function() s.line:Remove() end) end
 end
- 
+
 local function ClearAllESP()
     for _, d in pairs(ESPObjects) do DestroyESPEntry(d) end
     ESPObjects = {}
 end
- 
+
 local function CreateESPForPlayer(player)
     if player == LocalPlayer then return end
     if ESPObjects[player] then return end
     local col = State.ESP.Color
     local d   = {}
- 
+
     d.Box              = Drawing.new("Square")
     d.Box.Visible      = false
     d.Box.Color        = col
     d.Box.Thickness    = 1
     d.Box.Filled       = false
- 
+
     d.Name             = Drawing.new("Text")
     d.Name.Visible     = false
     d.Name.Color       = col
     d.Name.Size        = 14
     d.Name.Center      = true
     d.Name.Outline     = true
- 
+
     d.Distance         = Drawing.new("Text")
     d.Distance.Visible = false
     d.Distance.Color   = col
     d.Distance.Size    = 12
     d.Distance.Center  = true
     d.Distance.Outline = true
- 
+
     d.Tracer           = Drawing.new("Line")
     d.Tracer.Visible   = false
     d.Tracer.Color     = col
     d.Tracer.Thickness = 1
- 
+
     d.Highlight                     = Instance.new("Highlight")
     d.Highlight.FillTransparency    = 0.5
     d.Highlight.OutlineTransparency = 0
     d.Highlight.FillColor           = col
     d.Highlight.OutlineColor        = col
- 
+
     d.TeamLabel         = Drawing.new("Text")
     d.TeamLabel.Visible = false
     d.TeamLabel.Color   = State.ESP.TeamColor
@@ -644,20 +596,20 @@ local function CreateESPForPlayer(player)
     d.TeamLabel.Center  = true
     d.TeamLabel.Outline = true
     d.TeamLabel.Text    = "TEAM"
- 
+
     d.Skeleton  = {}
     d.lastChar  = nil
     d.lastColor = col
- 
+
     ESPObjects[player] = d
 end
- 
+
 local function SetupESP()
     ClearAllESP()
     if not State.ESP.Enabled then return end
     for _, p in ipairs(Players:GetPlayers()) do CreateESPForPlayer(p) end
 end
- 
+
 local function UpdateESPPlayer(player, d, selfRoot, rainbowCol)
     pcall(function() d.Box.Visible       = false end)
     pcall(function() d.Name.Visible      = false end)
@@ -665,7 +617,7 @@ local function UpdateESPPlayer(player, d, selfRoot, rainbowCol)
     pcall(function() d.Tracer.Visible    = false end)
     pcall(function() d.TeamLabel.Visible = false end)
     for _, s in ipairs(d.Skeleton) do pcall(function() s.line.Visible = false end) end
- 
+
     local char = GetCharacter(player)
     local root, hum, head
     if char then
@@ -673,24 +625,23 @@ local function UpdateESPPlayer(player, d, selfRoot, rainbowCol)
         hum  = char:FindFirstChildOfClass("Humanoid")
         head = char:FindFirstChild("Head")
     end
- 
+
     local alive = char ~= nil and root ~= nil and hum ~= nil and hum.Health > 0
- 
     local isTeam = State.ESP.TeamCheck and IsTeammate(player)
+
     if isTeam then
         if State.ESP.TeamMode == "hide" then
             pcall(function() if d.Highlight.Parent ~= nil then d.Highlight.Parent = nil end end)
             return
         end
     end
- 
-    -- NOTE: Highlight is now attached AFTER distance check (see below)
+
     if not alive then
         pcall(function() if d.Highlight.Parent ~= nil then d.Highlight.Parent = nil end end)
         return
     end
     if char ~= d.lastChar then RebuildSkeleton(d, char) end
- 
+
     local col
     if isTeam then
         col = State.ESP.TeamColor
@@ -699,7 +650,7 @@ local function UpdateESPPlayer(player, d, selfRoot, rainbowCol)
     else
         col = State.ESP.Color
     end
- 
+
     if col ~= d.lastColor or State.ESP.Rainbow then
         d.lastColor = col
         pcall(function()
@@ -712,19 +663,17 @@ local function UpdateESPPlayer(player, d, selfRoot, rainbowCol)
             for _, s in ipairs(d.Skeleton) do s.line.Color = col end
         end)
     end
- 
+
     local rootPos    = root.Position
     local headPos    = head and head.Position or (rootPos + Vector3.new(0, 2.5, 0))
     local feetPos    = rootPos - Vector3.new(0, 3, 0)
     local headTopPos = headPos + Vector3.new(0, 0.6, 0)
- 
+
     local rootSP,    rootOn = W2S(rootPos)
     local headSP,    headOn = W2S(headPos)
     local feetSP,    _      = W2S(feetPos)
     local headTopSP, _      = W2S(headTopPos)
- 
-    -- FIX: distance + on-screen guard BEFORE attaching Highlight so out-of-range
-    --      players don't keep a bright outline visible through walls.
+
     if not rootOn then
         pcall(function() if d.Highlight.Parent ~= nil then d.Highlight.Parent = nil end end)
         return
@@ -735,8 +684,7 @@ local function UpdateESPPlayer(player, d, selfRoot, rainbowCol)
             return
         end
     end
- 
-    -- Highlight (only attached once we know the player is in range / on screen)
+
     pcall(function()
         if State.ESP.Highlight and not isTeam then
             if d.Highlight.Parent ~= char then d.Highlight.Parent = char end
@@ -744,7 +692,7 @@ local function UpdateESPPlayer(player, d, selfRoot, rainbowCol)
             if d.Highlight.Parent ~= nil then d.Highlight.Parent = nil end
         end
     end)
- 
+
     if isTeam and State.ESP.TeamMode == "color" then
         pcall(function()
             d.TeamLabel.Color    = State.ESP.TeamColor
@@ -752,7 +700,7 @@ local function UpdateESPPlayer(player, d, selfRoot, rainbowCol)
             d.TeamLabel.Visible  = true
         end)
     end
- 
+
     if State.ESP.Box then
         pcall(function()
             local topY = math.min(headTopSP.Y, feetSP.Y)
@@ -764,7 +712,7 @@ local function UpdateESPPlayer(player, d, selfRoot, rainbowCol)
             d.Box.Visible  = true
         end)
     end
- 
+
     if State.ESP.Names then
         pcall(function()
             d.Name.Text     = player.DisplayName
@@ -772,7 +720,7 @@ local function UpdateESPPlayer(player, d, selfRoot, rainbowCol)
             d.Name.Visible  = true
         end)
     end
- 
+
     if State.ESP.Distance then
         pcall(function()
             local dist      = selfRoot and math.floor((selfRoot.Position - rootPos).Magnitude) or 0
@@ -781,7 +729,7 @@ local function UpdateESPPlayer(player, d, selfRoot, rainbowCol)
             d.Distance.Visible  = true
         end)
     end
- 
+
     if State.ESP.Tracer then
         pcall(function()
             d.Tracer.From    = Vector2.new(_vpCenter.X, _vpCenter.Y * 2)
@@ -789,7 +737,7 @@ local function UpdateESPPlayer(player, d, selfRoot, rainbowCol)
             d.Tracer.Visible = true
         end)
     end
- 
+
     if State.ESP.Skeleton then
         for _, s in ipairs(d.Skeleton) do
             pcall(function()
@@ -808,7 +756,7 @@ local function UpdateESPPlayer(player, d, selfRoot, rainbowCol)
         end
     end
 end
- 
+
 local function UpdateESP(rainbowCol)
     local selfRoot = GetRoot(LocalPlayer)
     if not State.ESP.Enabled then
@@ -819,11 +767,11 @@ local function UpdateESP(rainbowCol)
         pcall(UpdateESPPlayer, player, d, selfRoot, rainbowCol)
     end
 end
- 
+
 -- ============================================================
 -- // VISUALS
 -- ============================================================
- 
+
 local function SetAtmo(a, vals)
     if not a then return end
     if vals.Density  ~= nil then pcall(function() a.Density  = vals.Density  end) end
@@ -831,7 +779,7 @@ local function SetAtmo(a, vals)
     if vals.Glare    ~= nil then pcall(function() a.Glare    = vals.Glare    end) end
     if vals.FogBlend ~= nil then pcall(function() a.FogBlend = vals.FogBlend end) end
 end
- 
+
 local function SetupFullbright()
     if State.Fullbright then
         Lighting.Ambient        = Color3.fromRGB(255,255,255)
@@ -855,7 +803,7 @@ local function SetupFullbright()
         end
     end
 end
- 
+
 local function SetupNoFog()
     if State.NoFog then
         Lighting.FogEnd   = 1e9
@@ -870,24 +818,20 @@ local function SetupNoFog()
         end
     end
 end
- 
+
 local function SetupNoShadows()
     Lighting.GlobalShadows = not State.NoShadows and LDefault.GlobalShadows or false
 end
- 
+
 local function SetupFPSBoost()
     Drop("FPSParticle")
     if State.FPSBoost then
-        -- (a) Disable shadows
         Lighting.GlobalShadows = false
-        -- (b) Lower Roblox render quality to minimum
         pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
-        -- (c) Cap at Level01 via UserGameSettings too
         pcall(function()
             local ugs = game:GetService("UserGameSettings")
             ugs.SavedQualityLevel = Enum.SavedQualitySetting.QualityLevel1
         end)
-        -- (d) Disable all PostEffects in Lighting
         FPSParticleCache = {}
         for _, fx in ipairs(Lighting:GetDescendants()) do
             if fx:IsA("PostEffect") then
@@ -895,7 +839,6 @@ local function SetupFPSBoost()
                 pcall(function() fx.Enabled = false end)
             end
         end
-        -- (e) Disable particles, fire, smoke, sparkles, trails in workspace
         for _, v in ipairs(workspace:GetDescendants()) do
             if v:IsA("ParticleEmitter") or v:IsA("Fire")
             or v:IsA("Smoke")           or v:IsA("Sparkles")
@@ -903,25 +846,21 @@ local function SetupFPSBoost()
                 FPSParticleCache[v] = v.Enabled
                 pcall(function() v.Enabled = false end)
             end
-            -- PBR SurfaceAppearance is very expensive: disable it
             if v:IsA("SurfaceAppearance") then
                 FPSParticleCache[v] = v.Parent
                 pcall(function() v.Parent = nil end)
             end
         end
-        -- (f) Disable Atmosphere (expensive density/scatter calcs)
         local atmo = Lighting:FindFirstChildOfClass("Atmosphere")
         if atmo then
             FPSParticleCache[atmo] = atmo.Parent
             pcall(function() atmo.Parent = nil end)
         end
-        -- (g) Disable Sky (cubemap sampling)
         local sky = Lighting:FindFirstChildOfClass("Sky")
         if sky then
             FPSParticleCache[sky] = sky.Parent
             pcall(function() sky.Parent = nil end)
         end
-        -- (h) Watch for new instances spawned at runtime
         Conn("FPSParticle", workspace.DescendantAdded:Connect(function(v)
             if not State.FPSBoost then return end
             if v:IsA("ParticleEmitter") or v:IsA("Fire")
@@ -944,7 +883,6 @@ local function SetupFPSBoost()
             end
         end))
     else
-        -- Restore render quality
         pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Automatic end)
         pcall(function()
             local ugs = game:GetService("UserGameSettings")
@@ -953,11 +891,9 @@ local function SetupFPSBoost()
         if not State.NoShadows then
             Lighting.GlobalShadows = LDefault.GlobalShadows
         end
-        -- Restore all cached instances
         for v, was in pairs(FPSParticleCache) do
             pcall(function()
                 if not v then return end
-                -- SurfaceAppearance and Atmosphere/Sky were re-parented (was = parent)
                 if typeof(was) == "Instance" then
                     if v and not v.Parent then v.Parent = was end
                 elseif v.Parent then
@@ -968,11 +904,11 @@ local function SetupFPSBoost()
         FPSParticleCache = {}
     end
 end
- 
+
 -- ============================================================
 -- // MOVEMENT
 -- ============================================================
- 
+
 local function SetupTPWalk()
     Drop("TPWalk")
     if not State.Movement.TPWalk then return end
@@ -1005,13 +941,13 @@ local function SetupTPWalk()
         end))
     end
 end
- 
+
 local function ApplyWalkSpeed()
     local h = GetHumanoid(LocalPlayer)
     if not h then return end
     h.WalkSpeed = State.Movement.WalkSpeed and State.Movement.WalkSpeedValue or Defaults.WalkSpeed
 end
- 
+
 local function SetupFly()
     Drop("Fly")
     local char = GetCharacter(LocalPlayer)
@@ -1043,17 +979,15 @@ local function SetupFly()
         g.CFrame   = cam.CFrame
     end))
 end
- 
-local SpinBAV = nil   -- BodyAngularVelocity instance for spin
- 
+
+local SpinBAV = nil
+
 local function SetupSpin()
     Drop("Spin")
-    -- Clean up old BAV
     if SpinBAV then pcall(function() SpinBAV:Destroy() end); SpinBAV = nil end
     if not State.Movement.Spin then return end
     local root = GetRoot(LocalPlayer)
     if not root then
-        -- Retry once character loads
         Conn("Spin", RunService.Heartbeat:Connect(function()
             local r = GetRoot(LocalPlayer)
             if not r then return end
@@ -1065,7 +999,6 @@ local function SetupSpin()
             bav.P                = math.huge
             bav.Parent           = r
             SpinBAV              = bav
-            -- Heartbeat to keep AngularVelocity updated if speed slider changes
             Conn("Spin", RunService.Heartbeat:Connect(function()
                 if not State.Movement.Spin then return end
                 if SpinBAV and SpinBAV.Parent then
@@ -1081,7 +1014,6 @@ local function SetupSpin()
     bav.P                = math.huge
     bav.Parent           = root
     SpinBAV              = bav
-    -- Heartbeat to sync speed slider changes live
     Conn("Spin", RunService.Heartbeat:Connect(function()
         if not State.Movement.Spin then return end
         if SpinBAV and SpinBAV.Parent then
@@ -1089,7 +1021,7 @@ local function SetupSpin()
         end
     end))
 end
- 
+
 local function SetupInfJump()
     Drop("InfJump")
     if not State.Movement.InfJump then return end
@@ -1098,7 +1030,7 @@ local function SetupInfJump()
         if h then h:ChangeState(Enum.HumanoidStateType.Jumping) end
     end))
 end
- 
+
 local function SetupNoclip()
     Drop("Noclip")
     if not State.Movement.Noclip then
@@ -1117,9 +1049,7 @@ local function SetupNoclip()
         end
     end))
 end
- 
--- FIX GodMode: Heartbeat loop continuously restores health so server-side
--- resets cannot kill the player. BreakJointsOnDeath=false prevents ragdoll.
+
 local function SetupGodMode()
     Drop("GodMode"); Drop("GodModeMax"); Drop("GodModeHB")
     if not State.Movement.GodMode then return end
@@ -1127,19 +1057,16 @@ local function SetupGodMode()
     pcall(function() h.MaxHealth = math.huge end)
     pcall(function() h.Health    = math.huge end)
     pcall(function() h.BreakJointsOnDeath = false end)
-    -- React immediately to HealthChanged events
     Conn("GodMode", h.HealthChanged:Connect(function()
         if State.Movement.GodMode then
             pcall(function() h.Health = h.MaxHealth end)
         end
     end))
-    -- React if server resets MaxHealth
     Conn("GodModeMax", h:GetPropertyChangedSignal("MaxHealth"):Connect(function()
         if State.Movement.GodMode then
             pcall(function() h.MaxHealth = math.huge; h.Health = math.huge end)
         end
     end))
-    -- Heartbeat safety net: catches any health drain the events might miss
     Conn("GodModeHB", RunService.Heartbeat:Connect(function()
         if not State.Movement.GodMode then return end
         local hum = GetHumanoid(LocalPlayer)
@@ -1148,7 +1075,7 @@ local function SetupGodMode()
         end
     end))
 end
- 
+
 local function GetNearestPlayerRoot()
     local sr = GetRoot(LocalPlayer); if not sr then return nil end
     local best, bestD = nil, math.huge
@@ -1163,7 +1090,7 @@ local function GetNearestPlayerRoot()
     end
     return best
 end
- 
+
 local function GetRandomPlayerRoot()
     local roots = {}
     for _, p in ipairs(Players:GetPlayers()) do
@@ -1175,7 +1102,7 @@ local function GetRandomPlayerRoot()
     if #roots == 0 then return nil end
     return roots[math.random(1, #roots)]
 end
- 
+
 local function SetupOrbit()
     Drop("Orbit"); Drop("OrbitClick")
     OrbitTarget = nil; OrbitAngle = 0; OrbitAutoTimer = 0
@@ -1219,13 +1146,11 @@ local function SetupOrbit()
         root.CFrame  = CFrame.new(op, OrbitTarget.Position)
     end))
 end
- 
+
 -- ============================================================
 -- // TRIGGERBOT
 -- ============================================================
--- Wall-check: gated on State.Triggerbot.WallCheck, uses RaycastVisible directly.
--- Team-check: gated on State.Triggerbot.TeamCheck, fully independent of aimbot.
- 
+
 local function SimulateLMBClick()
     if mouse1click then
         pcall(mouse1click)
@@ -1234,27 +1159,25 @@ local function SimulateLMBClick()
         task.delay(0.05, function() pcall(mouse1release) end)
     end
 end
- 
+
 local function RunTriggerbot(dt)
     if not State.Triggerbot.Enabled then
         _tbWasInView = false; _tbSpamTimer = 0
         return
     end
- 
+
     local inView = false
     local radius = State.Triggerbot.Radius
     local cx, cy = _vpCenter.X, _vpCenter.Y
- 
+
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= LocalPlayer and IsAlive(p)
-        -- FIX: uses its own independent TeamCheck flag
         and not (State.Triggerbot.TeamCheck and IsTeammate(p)) then
             local char = GetCharacter(p)
             local head = char and char:FindFirstChild("Head")
             if head then
                 local sp, on = W2S(head.Position)
                 if on and (sp - Vector2.new(cx, cy)).Magnitude <= radius then
-                    -- FIX: wall-check gates on Triggerbot.WallCheck, not Aimbot.WallCheck
                     if not State.Triggerbot.WallCheck or RaycastVisible(head) then
                         inView = true
                         break
@@ -1263,7 +1186,7 @@ local function RunTriggerbot(dt)
             end
         end
     end
- 
+
     if State.Triggerbot.Spam then
         if inView then
             _tbSpamTimer = _tbSpamTimer + dt
@@ -1279,24 +1202,30 @@ local function RunTriggerbot(dt)
             SimulateLMBClick()
         end
     end
- 
+
     _tbWasInView = inView
 end
- 
+
 -- ============================================================
--- // HITBOX EXPANDER  (v2.7.2 – ghost-part approach)
+-- // HITBOX EXPANDER  (v2.7.3 – CFrame-sync approach)
 -- ============================================================
--- Creates a larger GHOST part welded to each target body part.
---   • CanQuery  = true  → workspace raycasts (used by most FPS games) HIT it
---   • CanCollide = false → doesn't block player movement
---   • Original part is NEVER resized → no broken Motor6D joints, no frozen chars
---   • SmoothPlastic + configurable transparency for the visual indicator
---   • WeldConstraint keeps it attached through animation frames
---   • TeamCheck: teammates are skipped entirely
+-- Ghost parts are Anchored=true and parented to workspace.
+-- Their CFrame is updated every Heartbeat to follow the original part.
+--
+-- WHY NO WELDCONSTRAINT:
+--   WeldConstraint creates a rigid-body link between two physics objects.
+--   When attached to a character limb, the physics solver must reconcile the
+--   ghost's inertia against the Motor6D-driven animation every frame, which
+--   fights the animator and can freeze or jitter characters. Anchored parts
+--   with manual CFrame sync carry zero physics cost on the remote character
+--   because they are never part of its assembly. CanQuery=true is all that
+--   is needed for workspace raycasts (used by most FPS hit-detection) to
+--   register the enlarged part.
 -- ============================================================
- 
-local HitboxParts = {}   -- player -> { {ghost=Part, weld=WeldConstraint, hl=Highlight?} }
- 
+
+local HitboxParts = {}   -- player -> { entries={{ghost,origPart}}, hl }
+
+-- Creates one enlarged ghost part in workspace, fully decoupled from physics.
 local function MakeGhostPart(origPart)
     local expand = State.Hitbox.Size
     local ghost             = Instance.new("Part")
@@ -1306,42 +1235,38 @@ local function MakeGhostPart(origPart)
     ghost.Material          = Enum.Material.SmoothPlastic
     ghost.Color             = State.Hitbox.Color
     ghost.Transparency      = 0.65
-    ghost.CanCollide        = false
+    ghost.CanCollide        = false   -- never blocks movement
     ghost.CanTouch          = false
-    ghost.CanQuery          = true    -- KEY: workspace raycasts register this part
+    ghost.CanQuery          = true    -- raycasts register this part
     ghost.CastShadow        = false
     ghost.Massless          = true
-    ghost.Anchored          = false
-    ghost.Parent            = origPart.Parent  -- same parent = same model
- 
-    local wc                = Instance.new("WeldConstraint")
-    wc.Part0                = origPart
-    wc.Part1                = ghost
-    wc.Parent               = ghost
- 
-    return ghost, wc
+    ghost.Anchored          = true    -- anchored → no physics coupling to character
+    -- Parent to workspace so it is completely independent of the character model.
+    -- This means Motor6D / animation system never sees or touches this part.
+    ghost.Parent            = workspace
+    return ghost
 end
- 
+
 local function BuildHitboxForPlayer(player)
     if player == LocalPlayer then return end
     if State.Hitbox.TeamCheck and IsTeammate(player) then return end
     if HitboxParts[player] then return end
     local char = GetCharacter(player)
     if not char then return end
- 
+
     local entries = {}
     for partName, enabled in pairs(State.Hitbox.Parts) do
         if enabled then
             local orig = char:FindFirstChild(partName)
             if orig and orig:IsA("BasePart") then
-                local ghost, wc = MakeGhostPart(orig)
-                table.insert(entries, { ghost=ghost, weld=wc, origPart=orig })
+                local ghost = MakeGhostPart(orig)
+                -- Store origPart reference so we can sync CFrame each frame
+                table.insert(entries, { ghost = ghost, origPart = orig })
             end
         end
     end
-    if #entries == 0 then return end   -- char not loaded yet – retry next tick
- 
-    -- Optional character-level Highlight for a clear visual overlay
+    if #entries == 0 then return end   -- char parts not loaded yet – retry next tick
+
     local hl = nil
     if State.Hitbox.Highlight then
         hl = Instance.new("Highlight")
@@ -1353,36 +1278,39 @@ local function BuildHitboxForPlayer(player)
     end
     HitboxParts[player] = { entries = entries, hl = hl }
 end
- 
+
 local function RemoveHitboxForPlayer(player)
     local data = HitboxParts[player]
     if not data then return end
     for _, e in ipairs(data.entries) do
         pcall(function()
-            if e.weld  and e.weld.Parent  then e.weld:Destroy()  end
             if e.ghost and e.ghost.Parent then e.ghost:Destroy() end
         end)
     end
     if data.hl then pcall(function() data.hl:Destroy() end) end
     HitboxParts[player] = nil
 end
- 
+
 local function ClearAllHitboxes()
     for player in pairs(HitboxParts) do RemoveHitboxForPlayer(player) end
     HitboxParts = {}
 end
- 
+
+-- Called every Heartbeat: syncs ghost CFrame/size/color and manages highlights.
 local function RefreshHitboxProperties()
     local expand = State.Hitbox.Size
     for player, data in pairs(HitboxParts) do
         for _, e in ipairs(data.entries) do
             pcall(function()
                 if not e.ghost or not e.ghost.Parent then return end
-                e.ghost.Size  = e.origPart.Size + Vector3.new(expand,expand,expand)*2
-                e.ghost.Color = State.Hitbox.Color
+                if not e.origPart or not e.origPart.Parent then return end
+                -- Follow the animated limb without any physics coupling
+                e.ghost.CFrame = e.origPart.CFrame
+                e.ghost.Size   = e.origPart.Size + Vector3.new(expand, expand, expand) * 2
+                e.ghost.Color  = State.Hitbox.Color
             end)
         end
-        -- Sync highlight
+        -- Highlight management
         local char = GetCharacter(player)
         if State.Hitbox.Highlight and char then
             if not data.hl or not data.hl.Parent then
@@ -1405,7 +1333,7 @@ local function RefreshHitboxProperties()
         end
     end
 end
- 
+
 local function SetupHitbox()
     Drop("HitboxClean")
     if not State.Hitbox.Enabled then
@@ -1415,13 +1343,15 @@ local function SetupHitbox()
     for _, p in ipairs(Players:GetPlayers()) do BuildHitboxForPlayer(p) end
     Conn("HitboxClean", RunService.Heartbeat:Connect(function()
         if not State.Hitbox.Enabled then return end
-        -- Build for players without hitboxes yet
+
+        -- Build for any player that doesn't have hitboxes yet
         for _, p in ipairs(Players:GetPlayers()) do
             if p ~= LocalPlayer and not HitboxParts[p] then
                 BuildHitboxForPlayer(p)
             end
         end
-        -- Detect stale ghost parts (respawn destroyed char) and rebuild
+
+        -- Stale detection: ghost destroyed OR origPart removed (respawn)
         for player, data in pairs(HitboxParts) do
             local char = GetCharacter(player)
             if not char then
@@ -1429,7 +1359,10 @@ local function SetupHitbox()
             else
                 local stale = false
                 for _, e in ipairs(data.entries) do
-                    if not e.ghost or not e.ghost.Parent then stale=true; break end
+                    if (not e.ghost or not e.ghost.Parent) or
+                       (not e.origPart or not e.origPart.Parent) then
+                        stale = true; break
+                    end
                 end
                 if stale then
                     RemoveHitboxForPlayer(player)
@@ -1437,10 +1370,12 @@ local function SetupHitbox()
                 end
             end
         end
+
+        -- Sync ghost CFrames to follow animations this tick
         RefreshHitboxProperties()
     end))
 end
- 
+
 local function SetupAntiFling()
     Drop("AntiFling")
     if not State.AntiFling then return end
@@ -1451,13 +1386,10 @@ local function SetupAntiFling()
         end
     end))
 end
- 
--- FIX: also reset TweenTPActive so click-TP isn't permanently locked after
--- the character dies mid-tween (Tween.Completed may never fire if root destroyed).
+
 local function OnCharacterAdded()
     task.wait(0.5)
-    TweenTPActive = false   -- FIX: unstick tween flag on respawn
-    -- Spin BAV was attached to old (now destroyed) root; re-attach
+    TweenTPActive = false
     if SpinBAV then pcall(function() SpinBAV:Destroy() end); SpinBAV = nil end
     RefreshDefaults()
     if State.Movement.Fly       then SetupFly()       end
@@ -1471,21 +1403,21 @@ local function OnCharacterAdded()
     if State.Movement.InfJump   then SetupInfJump()   end
     if State.Movement.Noclip    then SetupNoclip()     end
 end
- 
+
 -- ============================================================
 -- // MUSIC
 -- ============================================================
- 
+
 local MusicSound      = Instance.new("Sound")
 MusicSound.Name       = "PolarisMusic"
 MusicSound.Parent     = SoundService
- 
+
 local function ApplyMusicSettings()
     MusicSound.Volume = State.Music.Volume
     pcall(function() MusicSound.PlaybackSpeed = State.Music.Pitch end)
     MusicSound.Looped = State.Music.Looped
 end
- 
+
 local function PlayMusic()
     if State.Music.ID == "" then return end
     MusicSound.SoundId = "rbxassetid://" .. State.Music.ID
@@ -1493,26 +1425,26 @@ local function PlayMusic()
     MusicSound:Play()
     State.Music.Playing = true
 end
- 
+
 local function StopMusic()
     MusicSound:Stop()
     State.Music.Playing = false
 end
- 
+
 -- ============================================================
 -- // CONFIG SYSTEM
 -- ============================================================
- 
+
 local CFG_FOLDER   = "polaris_configs"
 local CFG_EXT      = ".json"
 local CFG_AUTOLOAD = "polaris_autoload.txt"
- 
+
 local function C3S(c) return { c.R, c.G, c.B } end
 local function SC3(t)
     if type(t) ~= "table" or not t[1] then return nil end
     return Color3.new(t[1], t[2], t[3])
 end
- 
+
 local function SerializeState()
     local hbParts = {}
     for k, v in pairs(State.Hitbox.Parts) do hbParts[k] = v end
@@ -1553,31 +1485,23 @@ local function SerializeState()
             MaxDist      = State.ESP.MaxDist,
         },
         Movement = {
-            -- Walk
             WalkSpeed         = State.Movement.WalkSpeed,
             WalkSpeedValue    = State.Movement.WalkSpeedValue,
-            -- Jump
             JumpPower         = State.Movement.JumpPower,
             JumpPowerValue    = State.Movement.JumpPowerValue,
             InfJump           = State.Movement.InfJump,
-            -- Fly
             Fly               = State.Movement.Fly,
             FlySpeed          = State.Movement.FlySpeed,
-            -- Spin
             Spin              = State.Movement.Spin,
             SpinSpeed         = State.Movement.SpinSpeed,
-            -- Teleport walk
             TPWalk            = State.Movement.TPWalk,
             TPWalkTween       = State.Movement.TPWalkTween,
             TPWalkSpeed       = State.Movement.TPWalkSpeed,
-            -- Click TP
             ClickTP           = State.Movement.ClickTP,
             ClickTweenTP      = State.Movement.ClickTweenTP,
             ClickTweenTPSpeed = State.Movement.ClickTweenTPSpeed,
-            -- Utility
             Noclip            = State.Movement.Noclip,
             GodMode           = State.Movement.GodMode,
-            -- Orbit
             Orbit             = State.Movement.Orbit,
             OrbitSpeed        = State.Movement.OrbitSpeed,
             OrbitRadius       = State.Movement.OrbitRadius,
@@ -1615,7 +1539,7 @@ local function SerializeState()
         CameraFOV  = State.CameraFOV,
     }
 end
- 
+
 local function ApplyDeserializedState(d)
     if not d then return end
     if d.Aimbot then
@@ -1655,37 +1579,28 @@ local function ApplyDeserializedState(d)
     end
     if d.Movement then
         local m = d.Movement
-        -- Walk
         if m.WalkSpeed      ~= nil then State.Movement.WalkSpeed      = m.WalkSpeed      end
         if m.WalkSpeedValue ~= nil then State.Movement.WalkSpeedValue = m.WalkSpeedValue end
-        -- Jump
         if m.JumpPower      ~= nil then State.Movement.JumpPower      = m.JumpPower      end
         if m.JumpPowerValue ~= nil then State.Movement.JumpPowerValue = m.JumpPowerValue end
         if m.InfJump        ~= nil then State.Movement.InfJump = m.InfJump; SetupInfJump() end
-        -- Fly
         if m.FlySpeed       ~= nil then State.Movement.FlySpeed   = m.FlySpeed   end
         if m.Fly            ~= nil then State.Movement.Fly = m.Fly; SetupFly()   end
-        -- Spin
         if m.SpinSpeed      ~= nil then State.Movement.SpinSpeed  = m.SpinSpeed  end
         if m.Spin           ~= nil then State.Movement.Spin = m.Spin; SetupSpin() end
-        -- Teleport walk
         if m.TPWalkSpeed    ~= nil then State.Movement.TPWalkSpeed = m.TPWalkSpeed end
         if m.TPWalkTween    ~= nil then State.Movement.TPWalkTween = m.TPWalkTween end
         if m.TPWalk         ~= nil then State.Movement.TPWalk = m.TPWalk; SetupTPWalk() end
-        -- Click TP
         if m.ClickTweenTPSpeed ~= nil then State.Movement.ClickTweenTPSpeed = m.ClickTweenTPSpeed end
         if m.ClickTP        ~= nil then State.Movement.ClickTP      = m.ClickTP      end
         if m.ClickTweenTP   ~= nil then State.Movement.ClickTweenTP = m.ClickTweenTP end
-        -- Utility
         if m.Noclip  ~= nil then State.Movement.Noclip  = m.Noclip;  SetupNoclip()  end
         if m.GodMode ~= nil then State.Movement.GodMode = m.GodMode; SetupGodMode() end
-        -- Orbit
         if m.OrbitSpeed    ~= nil then State.Movement.OrbitSpeed    = m.OrbitSpeed    end
         if m.OrbitRadius   ~= nil then State.Movement.OrbitRadius   = m.OrbitRadius   end
         if m.OrbitMode     ~= nil then State.Movement.OrbitMode     = m.OrbitMode     end
         if m.OrbitCooldown ~= nil then State.Movement.OrbitCooldown = m.OrbitCooldown end
         if m.Orbit         ~= nil then State.Movement.Orbit = m.Orbit; SetupOrbit()  end
-        -- Apply live values
         ApplyWalkSpeed()
         local _h2 = GetHumanoid(LocalPlayer)
         if _h2 and State.Movement.JumpPower then _h2.JumpPower = State.Movement.JumpPowerValue end
@@ -1740,11 +1655,9 @@ local function ApplyDeserializedState(d)
         State.CameraFOV         = d.CameraFOV
         GetCamera().FieldOfView = d.CameraFOV
     end
-    -- Sync all GUI widgets to the newly loaded state values
     task.defer(SyncGUI)
 end
- 
--- File I/O helpers (all pcall-guarded)
+
 local function CFGEnsureFolder()
     pcall(function()
         if isfolder and not isfolder(CFG_FOLDER) then
@@ -1752,15 +1665,13 @@ local function CFGEnsureFolder()
         end
     end)
 end
- 
--- FIX: filters to only .json files so stray files don't appear in the list
+
 local function CFGList()
     local names = {}
     pcall(function()
         if not (isfolder and listfiles) then return end
         if not isfolder(CFG_FOLDER) then return end
         for _, f in ipairs(listfiles(CFG_FOLDER)) do
-            -- Only process files ending in .json
             if not f:match("%.json$") then continue end
             local name = f:match("[/\\]?([^/\\]+)$")
             if name then
@@ -1771,7 +1682,7 @@ local function CFGList()
     end)
     return names
 end
- 
+
 local function CFGSave(name)
     if not writefile then return false, "writefile not available" end
     CFGEnsureFolder()
@@ -1784,7 +1695,7 @@ local function CFGSave(name)
     pcall(writefile, CFG_AUTOLOAD, name)
     return true
 end
- 
+
 local function CFGLoad(name)
     if not readfile then return false, "readfile not available" end
     local ok, json = pcall(readfile, CFG_FOLDER .. "/" .. name .. CFG_EXT)
@@ -1795,12 +1706,11 @@ local function CFGLoad(name)
     pcall(writefile, CFG_AUTOLOAD, name)
     return true
 end
- 
+
 local function CFGDelete(name)
     pcall(function()
         if delfile then delfile(CFG_FOLDER .. "/" .. name .. CFG_EXT) end
     end)
-    -- If the deleted config was the auto-load target, clear the pointer
     pcall(function()
         if readfile then
             local ok, current = pcall(readfile, CFG_AUTOLOAD)
@@ -1810,26 +1720,17 @@ local function CFGDelete(name)
         end
     end)
 end
- 
--- Forward-declaration: statusLabel is set inside the Configs tab block below.
--- CFGAutoLoad uses it via upvalue after the GUI is built.
+
 local _cfgStatusLabel = nil
- 
--- FIX CRASH: PolarisNotify is defined later in the GUI section.
--- Forward-declare it here so CFGAutoLoad (which runs via task.delay) can call
--- it. Without this, Lua lexical scoping resolves it as a global nil and errors.
-local PolarisNotify   -- assigned below, after GUI helpers are set up
- 
+
 local function CFGAutoLoad()
-    -- DISABLED: autoload on startup is off by design (v2.7).
-    -- Users must manually press "Load" in the Configs tab.
-    -- This function is kept as a no-op so existing call sites don't error.
+    -- DISABLED (v2.7): users load configs manually via the Configs tab.
 end
- 
+
 -- ============================================================
 -- // GUI HELPERS
 -- ============================================================
- 
+
 local function New(class, props, children)
     local ok, inst = pcall(Instance.new, class)
     if not ok then return nil end
@@ -1841,18 +1742,18 @@ local function New(class, props, children)
     end
     return inst
 end
- 
+
 local function Tween(inst, info, props)
     if inst and inst.Parent then TweenService:Create(inst, info, props):Play() end
 end
- 
+
 local T_FAST = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 local T_MED  = TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
- 
+
 -- ============================================================
 -- // COLORS
 -- ============================================================
- 
+
 local C = {
     BG         = Color3.fromRGB(13,  13,  18),
     Sidebar    = Color3.fromRGB(17,  17,  24),
@@ -1873,16 +1774,16 @@ local C = {
     SliderBG   = Color3.fromRGB(30,  30,  42),
     Red        = Color3.fromRGB(220, 60,  60),
 }
- 
+
 -- ============================================================
 -- // SCREENGUI
 -- ============================================================
- 
+
 local guiParent
 local _cgOk, _cg = pcall(function() return game:GetService("CoreGui") end)
 if _cgOk and _cg then guiParent = _cg
 else guiParent = LocalPlayer:WaitForChild("PlayerGui") end
- 
+
 local ScreenGui = New("ScreenGui", {
     Name           = "PolarisGUI",
     ResetOnSpawn   = false,
@@ -1890,7 +1791,7 @@ local ScreenGui = New("ScreenGui", {
     IgnoreGuiInset = true,
     Parent         = guiParent,
 })
- 
+
 local WatermarkGui = New("ScreenGui", {
     Name           = "PolarisWatermark",
     ResetOnSpawn   = false,
@@ -1898,14 +1799,14 @@ local WatermarkGui = New("ScreenGui", {
     IgnoreGuiInset = true,
     Parent         = guiParent,
 })
- 
+
 -- ============================================================
--- // WATERMARK
+-- // WATERMARK  (top-right, shows version + fps + ping)
 -- ============================================================
- 
+
 local Watermark = New("Frame", {
-    Size             = UDim2.fromOffset(240, 30),
-    Position         = UDim2.new(1, -248, 0, 8),
+    Size             = UDim2.fromOffset(280, 30),
+    Position         = UDim2.new(1, -288, 0, 8),
     BackgroundColor3 = C.Panel,
     BorderSizePixel  = 0,
     ZIndex           = 60,
@@ -1914,7 +1815,7 @@ local Watermark = New("Frame", {
     New("UICorner", { CornerRadius = UDim.new(0, 7) }),
     New("UIStroke", { Color = C.Border, Thickness = 1 }),
 })
- 
+
 New("Frame", {
     Size             = UDim2.fromOffset(3, 18),
     Position         = UDim2.new(0, 0, 0.5, -9),
@@ -1923,12 +1824,13 @@ New("Frame", {
     ZIndex           = 61,
     Parent           = Watermark,
 }, { New("UICorner", { CornerRadius = UDim.new(1, 0) }) })
- 
+
+-- CHG v2.7.3: initial text already includes version; render loop keeps it updated
 local WatermarkLabel = New("TextLabel", {
     Size                   = UDim2.new(1, -12, 1, 0),
     Position               = UDim2.new(0, 10, 0, 0),
     BackgroundTransparency = 1,
-    Text                   = "polaris.gov",
+    Text                   = "polaris.gov v2.7.3",
     Font                   = Enum.Font.GothamBold,
     TextSize               = 11,
     TextColor3             = C.Accent,
@@ -1936,18 +1838,18 @@ local WatermarkLabel = New("TextLabel", {
     ZIndex                 = 62,
     Parent                 = Watermark,
 })
- 
+
 local _fpsCount  = 0
 local _fpsAccum  = 0
 local _fpsCached = 0
 local _wmAccum   = 0
- 
+
 -- ============================================================
 -- // DISCORD LINK  (bottom-right persistent label)
 -- ============================================================
- 
+
 local DISCORD_LINK = "https://discord.gg/2azAG826Tm"
- 
+
 New("Frame", {
     Name             = "PolarisDiscord",
     Size             = UDim2.fromOffset(220, 24),
@@ -1974,15 +1876,15 @@ New("Frame", {
         ZIndex=62,
     }),
 })
- 
+
 -- ============================================================
 -- // MAIN WINDOW
 -- ============================================================
- 
+
 local WIN_W     = 580
 local WIN_H     = 400
 local SIDEBAR_W = 140
- 
+
 local MainFrame = New("Frame", {
     Name             = "MainFrame",
     Size             = UDim2.fromOffset(WIN_W, WIN_H),
@@ -1995,7 +1897,7 @@ local MainFrame = New("Frame", {
     New("UICorner", { CornerRadius = UDim.new(0, 10) }),
     New("UIStroke", { Color = C.Border, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }),
 })
- 
+
 New("ImageLabel", {
     AnchorPoint            = Vector2.new(0.5, 0.5),
     Size                   = UDim2.new(1, 40, 1, 40),
@@ -2009,7 +1911,7 @@ New("ImageLabel", {
     ZIndex                 = 0,
     Parent                 = MainFrame,
 })
- 
+
 local Sidebar = New("Frame", {
     Size             = UDim2.new(0, SIDEBAR_W, 1, 0),
     BackgroundColor3 = C.Sidebar,
@@ -2018,12 +1920,12 @@ local Sidebar = New("Frame", {
     ZIndex           = 2,
     Parent           = MainFrame,
 }, { New("UICorner", { CornerRadius = UDim.new(0, 10) }) })
- 
+
 New("Frame", {
     Size=UDim2.new(0,1,1,0), Position=UDim2.new(1,-1,0,0),
     BackgroundColor3=C.Border, BorderSizePixel=0, ZIndex=3, Parent=Sidebar,
 })
- 
+
 local _logo = New("Frame", { Size=UDim2.new(1,0,0,54), BackgroundTransparency=1, ZIndex=3, Parent=Sidebar })
 New("TextLabel", {
     Size=UDim2.new(1,-16,0,18), Position=UDim2.new(0,8,0,10),
@@ -2032,10 +1934,10 @@ New("TextLabel", {
 })
 New("TextLabel", {
     Size=UDim2.new(1,-16,0,12), Position=UDim2.new(0,8,0,30),
-    BackgroundTransparency=1, Text="v2.7.2 universal", Font=Enum.Font.Gotham,
+    BackgroundTransparency=1, Text="v2.7.3 universal", Font=Enum.Font.Gotham,
     TextSize=10, TextColor3=C.TextMuted, TextXAlignment=Enum.TextXAlignment.Left, ZIndex=4, Parent=_logo,
 })
- 
+
 local TabButtonList = New("ScrollingFrame", {
     Size=UDim2.new(1,0,1,-60), Position=UDim2.new(0,0,0,56),
     BackgroundTransparency=1, ScrollBarThickness=0,
@@ -2045,7 +1947,7 @@ local TabButtonList = New("ScrollingFrame", {
     New("UIListLayout", { Padding=UDim.new(0,3), FillDirection=Enum.FillDirection.Vertical, SortOrder=Enum.SortOrder.LayoutOrder }),
     New("UIPadding", { PaddingLeft=UDim.new(0,8), PaddingRight=UDim.new(0,8), PaddingTop=UDim.new(0,4) }),
 })
- 
+
 local TitleBar = New("Frame", {
     Size=UDim2.new(1,-SIDEBAR_W,0,44), Position=UDim2.new(0,SIDEBAR_W,0,0),
     BackgroundTransparency=1, ZIndex=3, Parent=MainFrame,
@@ -2065,17 +1967,17 @@ local CloseBtn = New("TextButton", {
         Font=Enum.Font.GothamBold, TextSize=16, TextColor3=C.White, ZIndex=5 }),
 })
 CloseBtn.MouseButton1Click:Connect(function() MainFrame.Visible = false end)
- 
+
 New("Frame", {
     Size=UDim2.new(1,-SIDEBAR_W,0,1), Position=UDim2.new(0,SIDEBAR_W,0,44),
     BackgroundColor3=C.Border, BorderSizePixel=0, ZIndex=3, Parent=MainFrame,
 })
- 
+
 local ContentPanel = New("Frame", {
     Size=UDim2.new(1,-SIDEBAR_W,1,-44), Position=UDim2.new(0,SIDEBAR_W,0,44),
     BackgroundTransparency=1, ClipsDescendants=true, ZIndex=2, Parent=MainFrame,
 })
- 
+
 local GuiVisible = true
 UserInputService.InputBegan:Connect(function(inp, gpe)
     if gpe then return end
@@ -2084,7 +1986,7 @@ UserInputService.InputBegan:Connect(function(inp, gpe)
         MainFrame.Visible = GuiVisible
     end
 end)
- 
+
 -- Drag
 do
     local dragging, dragStart, startPos
@@ -2103,15 +2005,15 @@ do
         if inp.UserInputType == Enum.UserInputType.MouseButton1 then dragging=false end
     end)
 end
- 
+
 -- ============================================================
 -- // TAB SYSTEM
 -- ============================================================
- 
+
 local Tabs      = {}
 local ActiveTab = nil
 local TabOrder  = 0
- 
+
 local function SwitchTab(name)
     if ActiveTab == name then return end
     ActiveTab = name
@@ -2126,9 +2028,9 @@ local function SwitchTab(name)
         t.Scroll.Visible = on
     end
 end
- 
+
 local OpenPopups = {}
- 
+
 local function CloseAllPopups()
     for _, ref in ipairs(OpenPopups) do
         if ref.frame and ref.frame.Parent then
@@ -2136,7 +2038,7 @@ local function CloseAllPopups()
         end
     end
 end
- 
+
 local function PointInAnyPopup(px, py)
     for _, ref in ipairs(OpenPopups) do
         if ref.open and ref.frame and ref.frame.Visible then
@@ -2149,7 +2051,7 @@ local function PointInAnyPopup(px, py)
     end
     return false
 end
- 
+
 local function CreateTab(name)
     TabOrder = TabOrder + 1
     local btn = New("TextButton", {
@@ -2189,7 +2091,7 @@ local function CreateTab(name)
     Tabs[name] = tabObj
     local Tab = {}
     local function NO() tabObj.Order = tabObj.Order+1; return tabObj.Order end
- 
+
     function Tab:CreateSection(title)
         local f = New("Frame", { Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=NO(), Parent=scroll })
         New("TextLabel", { Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text=string.upper(title),
@@ -2198,14 +2100,14 @@ local function CreateTab(name)
         New("Frame", { Size=UDim2.new(1,0,0,1), Position=UDim2.new(0,0,1,-1),
             BackgroundColor3=C.Border, BorderSizePixel=0, ZIndex=3, Parent=f })
     end
- 
+
     function Tab:CreateLabel(text)
         New("TextLabel", { Size=UDim2.new(1,0,0,22), BackgroundTransparency=1, Text=text,
             Font=Enum.Font.Gotham, TextSize=11, TextColor3=C.TextMuted,
             TextXAlignment=Enum.TextXAlignment.Left, TextWrapped=true,
             LayoutOrder=NO(), ZIndex=3, Parent=scroll })
     end
- 
+
     function Tab:CreateToggle(config)
         local val = config.CurrentValue or false
         local row = New("Frame", { Size=UDim2.new(1,0,0,36), BackgroundColor3=C.Element,
@@ -2231,13 +2133,12 @@ local function CreateTab(name)
         hb.MouseButton1Click:Connect(function() Set(not val) end)
         hb.MouseEnter:Connect(function() Tween(row,T_FAST,{BackgroundColor3=C.ElemHov}) end)
         hb.MouseLeave:Connect(function() Tween(row,T_FAST,{BackgroundColor3=C.Element}) end)
-        -- Register for GUI sync on config load
         if config.StateGet then
             RegisterSetter(config.StateGet, function(v) Set(v) end)
         end
         return { Set = Set }
     end
- 
+
     function Tab:CreateSlider(config)
         local val  = config.CurrentValue or config.Range[1]
         local minV = config.Range[1]
@@ -2279,7 +2180,6 @@ local function CreateTab(name)
         end)
         con.MouseEnter:Connect(function() Tween(con,T_FAST,{BackgroundColor3=C.ElemHov}) end)
         con.MouseLeave:Connect(function() Tween(con,T_FAST,{BackgroundColor3=C.Element}) end)
-        -- Register for GUI sync on config load
         if config.StateGet then
             RegisterSetter(config.StateGet, function(v)
                 local pct = (v - minV) / math.max(maxV - minV, 0.001)
@@ -2291,18 +2191,17 @@ local function CreateTab(name)
             SV(pct)
         end }
     end
- 
+
     function Tab:CreateColorPicker(config)
         local curCol   = config.Color or Color3.fromRGB(255,255,255)
         local rbOn     = false
-        local noRB     = config.NoRainbow == true   -- suppress the rainbow pill
+        local noRB     = config.NoRainbow == true
         local con = New("Frame", { Size=UDim2.new(1,0,0,36), BackgroundColor3=C.Element,
             BorderSizePixel=0, LayoutOrder=NO(), Parent=scroll,
         }, { New("UICorner", {CornerRadius=UDim.new(0,7)}) })
         New("TextLabel", { Size=UDim2.new(1,-90,1,0), Position=UDim2.new(0,12,0,0),
             BackgroundTransparency=1, Text=config.Name, Font=Enum.Font.Gotham, TextSize=12,
             TextColor3=C.Text, TextXAlignment=Enum.TextXAlignment.Left, ZIndex=3, Parent=con })
-        -- Rainbow toggle pill (hidden when NoRainbow=true)
         local rbPill = New("Frame", { Size=UDim2.fromOffset(28,16), Position=UDim2.new(1,-66,0.5,-8),
             BackgroundColor3=C.Off, BorderSizePixel=0, ZIndex=4, Visible=not noRB, Parent=con,
         }, { New("UICorner",{CornerRadius=UDim.new(1,0)}) })
@@ -2323,8 +2222,6 @@ local function CreateTab(name)
             local rbHB = New("TextButton", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text="", ZIndex=6, Parent=rbPill})
             rbHB.MouseButton1Click:Connect(function() SetRB(not rbOn) end)
         end
-        -- Color swatch: shift right when no RB pill
-        local swX = noRB and -36 or -36
         local sw = New("Frame", { Size=UDim2.fromOffset(22,22), Position=UDim2.new(1,-36,0.5,-11),
             BackgroundColor3=curCol, BorderSizePixel=0, ZIndex=4, Parent=con,
         }, { New("UICorner",{CornerRadius=UDim.new(0,4)}), New("UIStroke",{Color=C.Border,Thickness=1}) })
@@ -2366,12 +2263,11 @@ local function CreateTab(name)
         end)
         con.MouseEnter:Connect(function() Tween(con,T_FAST,{BackgroundColor3=C.ElemHov}) end)
         con.MouseLeave:Connect(function() Tween(con,T_FAST,{BackgroundColor3=C.Element}) end)
-        -- Register rainbow state for GUI sync if getter provided
         if config.RainbowStateGet then
             RegisterSetter(config.RainbowStateGet, function(v) SetRB(v) end)
         end
     end
- 
+
     function Tab:CreateButton(config)
         local b = New("TextButton", { Size=UDim2.new(1,0,0,34), BackgroundColor3=C.Element,
             BorderSizePixel=0, LayoutOrder=NO(), Text="", Parent=scroll,
@@ -2382,7 +2278,7 @@ local function CreateTab(name)
         b.MouseEnter:Connect(function() Tween(b,T_FAST,{BackgroundColor3=C.ElemHov}) end)
         b.MouseLeave:Connect(function() Tween(b,T_FAST,{BackgroundColor3=C.Element}) end)
     end
- 
+
     function Tab:CreateDisplay(config)
         local row = New("Frame", { Size=UDim2.new(1,0,0,36), BackgroundColor3=C.Element,
             BorderSizePixel=0, LayoutOrder=NO(), Parent=scroll,
@@ -2395,7 +2291,7 @@ local function CreateTab(name)
             TextSize=11, TextColor3=C.Accent, TextXAlignment=Enum.TextXAlignment.Right, ZIndex=3, Parent=row })
         return function(t) vl.Text = t end
     end
- 
+
     function Tab:CreateTextInput(config)
         local con = New("Frame", { Size=UDim2.new(1,0,0,56), BackgroundColor3=C.Element,
             BorderSizePixel=0, LayoutOrder=NO(), Parent=scroll,
@@ -2420,7 +2316,7 @@ local function CreateTab(name)
         con.MouseEnter:Connect(function() Tween(con,T_FAST,{BackgroundColor3=C.ElemHov}) end)
         con.MouseLeave:Connect(function() Tween(con,T_FAST,{BackgroundColor3=C.Element}) end)
     end
- 
+
     function Tab:CreateKeybind(config)
         local curKey  = config.DefaultKey or "MouseButton2"
         local listening = false
@@ -2455,15 +2351,14 @@ local function CreateTab(name)
         row.MouseEnter:Connect(function() Tween(row,T_FAST,{BackgroundColor3=C.ElemHov}) end)
         row.MouseLeave:Connect(function() Tween(row,T_FAST,{BackgroundColor3=C.Element}) end)
     end
- 
+
     return Tab
 end
- 
+
 -- ============================================================
 -- // NOTIFICATION
 -- ============================================================
- 
--- FIX: assigned here to fill the forward-declaration made before CFGAutoLoad.
+
 PolarisNotify = function(title, content, duration)
     local notif = New("Frame", { Size=UDim2.fromOffset(240,56), BackgroundColor3=C.Panel,
         BorderSizePixel=0, ZIndex=100, Parent=ScreenGui,
@@ -2485,11 +2380,11 @@ PolarisNotify = function(title, content, duration)
         if notif and notif.Parent then notif:Destroy() end
     end)
 end
- 
+
 -- ============================================================
 -- // BUILD TABS
 -- ============================================================
- 
+
 local AimbotTab   = CreateTab("Aimbot")
 local ESPTab      = CreateTab("ESP")
 local MovementTab = CreateTab("Movement")
@@ -2498,9 +2393,9 @@ local VisualTab   = CreateTab("Visuals")
 local HitboxTab   = CreateTab("Hitbox")
 local MiscTab     = CreateTab("Misc")
 local ConfigsTab  = CreateTab("Configs")
- 
+
 -- ── AIMBOT ────────────────────────────────────────────────────
- 
+
 AimbotTab:CreateSection("Aimbot")
 AimbotTab:CreateToggle({ Name="Enable Aimbot", CurrentValue=false,
     StateGet=function() return State.Aimbot.Enabled end,
@@ -2591,9 +2486,9 @@ AimbotTab:CreateSlider({ Name="Crosshair Radius", Range={1,80}, Increment=1, Suf
 AimbotTab:CreateSlider({ Name="Spam Delay", Range={1,100}, Increment=1, Suffix="ms", CurrentValue=80,
     StateGet=function() return math.floor(State.Triggerbot.Delay*1000+0.5) end,
     Callback=function(v) State.Triggerbot.Delay=v/1000 end })
- 
+
 -- ── ESP ───────────────────────────────────────────────────────
- 
+
 ESPTab:CreateSection("ESP")
 ESPTab:CreateToggle({ Name="Enable ESP", CurrentValue=false,
     StateGet=function() return State.ESP.Enabled end,
@@ -2659,15 +2554,15 @@ end
 ESPTab:CreateColorPicker({ Name="Team Color", Color=Color3.fromRGB(0,255,120),
     NoRainbow=true,
     Callback=function(v) State.ESP.TeamColor=v end })
- 
+
 -- ── MOVEMENT ──────────────────────────────────────────────────
- 
+
 MovementTab:CreateSection("Walk Speed")
 MovementTab:CreateToggle({ Name="Custom WalkSpeed", CurrentValue=false,
     Callback=function(v) State.Movement.WalkSpeed=v; ApplyWalkSpeed() end })
 MovementTab:CreateSlider({ Name="Walk Speed", Range={0,500}, Increment=1, CurrentValue=16,
     Callback=function(v) State.Movement.WalkSpeedValue=v; if State.Movement.WalkSpeed then ApplyWalkSpeed() end end })
- 
+
 MovementTab:CreateSection("Teleport Walk")
 MovementTab:CreateToggle({ Name="TPWalk", CurrentValue=false,
     Callback=function(v) State.Movement.TPWalk=v; SetupTPWalk() end })
@@ -2675,7 +2570,7 @@ MovementTab:CreateToggle({ Name="Tween Mode (off = instant teleport)", CurrentVa
     Callback=function(v) State.Movement.TPWalkTween=v; if State.Movement.TPWalk then SetupTPWalk() end end })
 MovementTab:CreateSlider({ Name="TPWalk Speed", Range={1,300}, Increment=1, CurrentValue=50,
     Callback=function(v) State.Movement.TPWalkSpeed=v end })
- 
+
 MovementTab:CreateSection("Jump")
 MovementTab:CreateToggle({ Name="Custom Jump Power", CurrentValue=false,
     Callback=function(v)
@@ -2692,19 +2587,19 @@ MovementTab:CreateSlider({ Name="Jump Power", Range={0,500}, Increment=1, Curren
     end })
 MovementTab:CreateToggle({ Name="Infinite Jump", CurrentValue=false,
     Callback=function(v) State.Movement.InfJump=v; SetupInfJump() end })
- 
+
 MovementTab:CreateSection("Fly")
 MovementTab:CreateToggle({ Name="Fly", CurrentValue=false,
     Callback=function(v) State.Movement.Fly=v; SetupFly() end })
 MovementTab:CreateSlider({ Name="Fly Speed", Range={0,300}, Increment=1, CurrentValue=50,
     Callback=function(v) State.Movement.FlySpeed=v end })
- 
+
 MovementTab:CreateSection("Spin")
 MovementTab:CreateToggle({ Name="Spin", CurrentValue=false,
     Callback=function(v) State.Movement.Spin=v; SetupSpin() end })
 MovementTab:CreateSlider({ Name="Spin Speed", Range={1,100}, Increment=1, CurrentValue=20,
     Callback=function(v) State.Movement.SpinSpeed=v end })
- 
+
 MovementTab:CreateSection("Click Teleport")
 MovementTab:CreateToggle({ Name="Click Tween TP", CurrentValue=false,
     Callback=function(v) State.Movement.ClickTweenTP=v; if v then State.Movement.ClickTP=false end end })
@@ -2712,13 +2607,13 @@ MovementTab:CreateSlider({ Name="Tween TP Speed", Range={1,100}, Increment=1, Cu
     Callback=function(v) State.Movement.ClickTweenTPSpeed=v end })
 MovementTab:CreateToggle({ Name="Click TP (Instant)", CurrentValue=false,
     Callback=function(v) State.Movement.ClickTP=v; if v then State.Movement.ClickTweenTP=false end end })
- 
+
 MovementTab:CreateSection("Utility")
 MovementTab:CreateToggle({ Name="Noclip", CurrentValue=false,
     Callback=function(v) State.Movement.Noclip=v; SetupNoclip() end })
 MovementTab:CreateToggle({ Name="GodMode", CurrentValue=false,
     Callback=function(v) State.Movement.GodMode=v; SetupGodMode() end })
- 
+
 MovementTab:CreateSection("Orbit")
 MovementTab:CreateToggle({ Name="Player Orbit", CurrentValue=false,
     Callback=function(v) State.Movement.Orbit=v; SetupOrbit() end })
@@ -2726,7 +2621,7 @@ MovementTab:CreateSlider({ Name="Orbit Speed", Range={1,200}, Increment=1, Curre
     Callback=function(v) State.Movement.OrbitSpeed=v end })
 MovementTab:CreateSlider({ Name="Orbit Radius", Range={2,30}, Increment=1, CurrentValue=5,
     Callback=function(v) State.Movement.OrbitRadius=v end })
- 
+
 do
     local modeBtns = {}
     local function SelMode(mode)
@@ -2756,9 +2651,9 @@ do
     MovementTab:CreateSlider({ Name="Auto Switch Cooldown", Range={1,100}, Increment=1, CurrentValue=10,
         Callback=function(v) State.Movement.OrbitCooldown = v / 10 end })
 end
- 
+
 -- ── MUSIC ─────────────────────────────────────────────────────
- 
+
 MusicTab:CreateSection("Built-in Presets")
 do
     local builtinList = {
@@ -2779,16 +2674,14 @@ do
         })
     end
 end
- 
+
 MusicTab:CreateSection("Custom Presets")
 MusicTab:CreateLabel("Add your own presets. They save with your config.")
- 
--- Container for dynamic custom preset buttons
+
 local customPresetScroll = Tabs["Music"].Scroll
-local customPresetLO = {}   -- track LayoutOrders of custom preset buttons so we can refresh
- 
+local customPresetLO = {}
+
 local function RefreshCustomPresets()
-    -- Remove all existing custom preset buttons (tagged by LayoutOrder range)
     for _, inst in ipairs(customPresetLO) do
         pcall(function() if inst and inst.Parent then inst:Destroy() end end)
     end
@@ -2802,7 +2695,6 @@ local function RefreshCustomPresets()
         New("TextLabel", { Size=UDim2.new(1,-80,1,0), Position=UDim2.new(0,10,0,0),
             BackgroundTransparency=1, Text=preset.name, Font=Enum.Font.Gotham, TextSize=11,
             TextColor3=C.Text, TextXAlignment=Enum.TextXAlignment.Left, ZIndex=3, Parent=row })
-        -- Play button
         local playB = New("TextButton", { Size=UDim2.fromOffset(36,22), Position=UDim2.new(1,-76,0.5,-11),
             BackgroundColor3=C.AccentDim, BorderSizePixel=0,
             Text="Play", Font=Enum.Font.GothamBold, TextSize=9, TextColor3=C.White,
@@ -2818,7 +2710,6 @@ local function RefreshCustomPresets()
         end)
         playB.MouseEnter:Connect(function() Tween(playB,T_FAST,{BackgroundColor3=C.Accent}) end)
         playB.MouseLeave:Connect(function() Tween(playB,T_FAST,{BackgroundColor3=C.AccentDim}) end)
-        -- Delete button
         local delB = New("TextButton", { Size=UDim2.fromOffset(36,22), Position=UDim2.new(1,-36,0.5,-11),
             BackgroundColor3=C.Red, BorderSizePixel=0,
             Text="Del", Font=Enum.Font.GothamBold, TextSize=9, TextColor3=C.White,
@@ -2836,8 +2727,7 @@ local function RefreshCustomPresets()
         delB.MouseLeave:Connect(function() Tween(delB,T_FAST,{BackgroundColor3=C.Red}) end)
     end
 end
- 
--- Add-preset inputs
+
 local _newPresetName = ""
 local _newPresetID   = ""
 local addNameTO = Tabs["Music"].Order + 1; Tabs["Music"].Order = addNameTO
@@ -2853,7 +2743,7 @@ local addNameBox = New("TextBox", { Size=UDim2.new(1,-24,0,26), Position=UDim2.n
     ClearTextOnFocus=false, ZIndex=4, Parent=addNcon,
 }, { New("UICorner",{CornerRadius=UDim.new(0,5)}), New("UIPadding",{PaddingLeft=UDim.new(0,6)}) })
 addNameBox:GetPropertyChangedSignal("Text"):Connect(function() _newPresetName = addNameBox.Text end)
- 
+
 local addIDto = Tabs["Music"].Order + 1; Tabs["Music"].Order = addIDto
 local addIDcon = New("Frame", { Size=UDim2.new(1,0,0,56), BackgroundColor3=C.Element,
     BorderSizePixel=0, LayoutOrder=addIDto, Parent=customPresetScroll,
@@ -2867,7 +2757,7 @@ local addIDBox = New("TextBox", { Size=UDim2.new(1,-24,0,26), Position=UDim2.new
     ClearTextOnFocus=false, ZIndex=4, Parent=addIDcon,
 }, { New("UICorner",{CornerRadius=UDim.new(0,5)}), New("UIPadding",{PaddingLeft=UDim.new(0,6)}) })
 addIDBox:GetPropertyChangedSignal("Text"):Connect(function() _newPresetID = addIDBox.Text end)
- 
+
 local addBTO = Tabs["Music"].Order + 1; Tabs["Music"].Order = addBTO
 local addBtn = New("TextButton", { Size=UDim2.new(1,0,0,34), BackgroundColor3=C.Element,
     BorderSizePixel=0, LayoutOrder=addBTO, Text="", Parent=customPresetScroll,
@@ -2886,9 +2776,9 @@ addBtn.MouseButton1Click:Connect(function()
 end)
 addBtn.MouseEnter:Connect(function() Tween(addBtn,T_FAST,{BackgroundColor3=C.ElemHov}) end)
 addBtn.MouseLeave:Connect(function() Tween(addBtn,T_FAST,{BackgroundColor3=C.Element}) end)
- 
+
 RefreshCustomPresets()
- 
+
 MusicTab:CreateSection("Player")
 MusicTab:CreateTextInput({ Name="Asset ID", Placeholder="Enter numeric ID", DefaultText="",
     Callback=function(v)
@@ -2911,13 +2801,13 @@ MusicTab:CreateButton({ Name="Play",
     end })
 MusicTab:CreateButton({ Name="Stop", Callback=function() StopMusic() end })
 MusicTab:CreateLabel("Enter asset ID (numbers only). Press Play.")
- 
+
 -- ── VISUALS ───────────────────────────────────────────────────
- 
+
 VisualTab:CreateSection("Camera")
 VisualTab:CreateSlider({ Name="Camera FOV", Range={10,120}, Increment=1, Suffix="°", CurrentValue=70,
     Callback=function(v) State.CameraFOV=v; GetCamera().FieldOfView=v end })
- 
+
 VisualTab:CreateSection("Lighting")
 VisualTab:CreateToggle({ Name="Fullbright", CurrentValue=false,
     Callback=function(v) State.Fullbright=v; SetupFullbright() end })
@@ -2925,14 +2815,15 @@ VisualTab:CreateToggle({ Name="No Fog", CurrentValue=false,
     Callback=function(v) State.NoFog=v; SetupNoFog() end })
 VisualTab:CreateToggle({ Name="No Shadows", CurrentValue=false,
     Callback=function(v) State.NoShadows=v; SetupNoShadows() end })
- 
+
 VisualTab:CreateSection("Performance")
 VisualTab:CreateToggle({ Name="Boost FPS", CurrentValue=false,
     Callback=function(v) State.FPSBoost=v; SetupFPSBoost() end })
- 
+
 -- ── HITBOX ────────────────────────────────────────────────────
- 
+
 HitboxTab:CreateSection("Hitbox Expander")
+HitboxTab:CreateLabel("Ghost parts are anchored in workspace and CFrame-synced. No physics coupling.")
 HitboxTab:CreateToggle({ Name="Enable Hitbox Expander", CurrentValue=false,
     StateGet=function() return State.Hitbox.Enabled end,
     Callback=function(v) State.Hitbox.Enabled=v; SetupHitbox() end })
@@ -2951,19 +2842,18 @@ HitboxTab:CreateToggle({ Name="Team Check (skip teammates)", CurrentValue=true,
         State.Hitbox.TeamCheck=v
         if State.Hitbox.Enabled then ClearAllHitboxes(); SetupHitbox() end
     end })
- 
+
 HitboxTab:CreateSection("Target Parts")
 do
     local partDefs = {
         {"Head",              "Head"            },
-        {"Torso  (R6 / R15)", "Torso"           },  -- Torso matches R6; UpperTorso also kept in State
+        {"Torso  (R6 / R15)", "Torso"           },
         {"HumanoidRootPart",  "HumanoidRootPart"},
         {"Right Arm",         "Right Arm"       },
         {"Left Arm",          "Left Arm"        },
         {"Right Leg",         "Right Leg"       },
         {"Left Leg",          "Left Leg"        },
     }
-    -- Also keep UpperTorso toggled together with Torso for R15
     for _, def in ipairs(partDefs) do
         local dn, sk = def[1], def[2]
         HitboxTab:CreateToggle({
@@ -2972,20 +2862,20 @@ do
             StateGet     = function() return State.Hitbox.Parts[sk] or false end,
             Callback     = function(v)
                 State.Hitbox.Parts[sk] = v
-                -- Mirror Torso <-> UpperTorso so both R6 and R15 are covered
                 if sk == "Torso" then State.Hitbox.Parts["UpperTorso"] = v end
                 if State.Hitbox.Enabled then ClearAllHitboxes(); SetupHitbox() end
             end
         })
     end
 end
+
 -- ── MISC ──────────────────────────────────────────────────────
- 
+
 MiscTab:CreateSection("Combat")
 MiscTab:CreateToggle({ Name="Anti-Fling", CurrentValue=false,
     StateGet=function() return State.AntiFling end,
     Callback=function(v) State.AntiFling=v; SetupAntiFling() end })
- 
+
 MiscTab:CreateSection("Location Finder")
 local setLocX = MiscTab:CreateDisplay({ Name="X", DefaultText="0.00" })
 local setLocY = MiscTab:CreateDisplay({ Name="Y", DefaultText="0.00" })
@@ -3000,23 +2890,18 @@ MiscTab:CreateButton({ Name="Copy Location to Clipboard",
             PolarisNotify("Copied", txt, 2)
         end
     end })
- 
+
 MiscTab:CreateSection("Kill Script")
 MiscTab:CreateLabel("Completely removes Polaris from the game session.")
 MiscTab:CreateButton({ Name="⚠  Kill Script",
     Callback=function()
-        -- 1. Stop all connections
         for name in pairs(Connections) do Drop(name) end
-        -- 2. Restore hitboxes
         pcall(ClearAllHitboxes)
-        -- 3. Clear ESP
         pcall(ClearAllESP)
-        -- 4. Remove drawing objects
         if _G._PolarisDrawings then
             for _, d in ipairs(_G._PolarisDrawings) do pcall(function() d:Remove() end) end
             _G._PolarisDrawings = nil
         end
-        -- 5. Restore movement state
         pcall(function()
             local h = GetHumanoid(LocalPlayer)
             if h then
@@ -3033,7 +2918,6 @@ MiscTab:CreateButton({ Name="⚠  Kill Script",
                 if SpinBAV then pcall(function() SpinBAV:Destroy() end); SpinBAV = nil end
             end
         end)
-        -- 6. Restore lighting
         pcall(function()
             Lighting.Ambient        = LDefault.Ambient
             Lighting.OutdoorAmbient = LDefault.OutdoorAmbient
@@ -3042,18 +2926,16 @@ MiscTab:CreateButton({ Name="⚠  Kill Script",
             Lighting.FogEnd         = LDefault.FogEnd
             Lighting.FogStart       = LDefault.FogStart
         end)
-        -- 7. Destroy GUI
         pcall(function() ScreenGui:Destroy() end)
         pcall(function() WatermarkGui:Destroy() end)
-        -- 8. Stop music
         pcall(function() MusicSound:Stop(); MusicSound:Destroy() end)
         print("[polaris.gov] script killed.")
     end })
- 
+
 MiscTab:CreateSection("Info")
-MiscTab:CreateLabel("universal | polaris.gov | v2.7.2")
+MiscTab:CreateLabel("universal | polaris.gov | v2.7.3")
 MiscTab:CreateLabel("RightAlt = toggle GUI visibility")
- 
+
 MiscTab:CreateSection("Discord")
 MiscTab:CreateLabel("discord.gg/2azAG826Tm")
 MiscTab:CreateButton({ Name="Copy Discord Link",
@@ -3061,24 +2943,22 @@ MiscTab:CreateButton({ Name="Copy Discord Link",
         CopyToClipboard(DISCORD_LINK)
         PolarisNotify("Discord", "Link copied to clipboard!", 2)
     end })
- 
+
 -- ── CONFIGS ───────────────────────────────────────────────────
- 
+
 do
     local cfgNameValue = ""
     local cfgScroll    = Tabs["Configs"].Scroll
     local cfgTabObj    = Tabs["Configs"]
     local function NO_C() cfgTabObj.Order=cfgTabObj.Order+1; return cfgTabObj.Order end
- 
-    -- Save/Load section header
+
     local sec1 = New("Frame",{Size=UDim2.new(1,0,0,26),BackgroundTransparency=1,LayoutOrder=NO_C(),Parent=cfgScroll})
     New("TextLabel",{Size=UDim2.fromScale(1,1),BackgroundTransparency=1,Text="SAVE / LOAD",
         Font=Enum.Font.GothamBold,TextSize=10,TextColor3=C.Accent,
         TextXAlignment=Enum.TextXAlignment.Left,ZIndex=3,Parent=sec1})
     New("Frame",{Size=UDim2.new(1,0,0,1),Position=UDim2.new(0,0,1,-1),
         BackgroundColor3=C.Border,BorderSizePixel=0,ZIndex=3,Parent=sec1})
- 
-    -- Name input
+
     local nameInputCon = New("Frame",{Size=UDim2.new(1,0,0,56),BackgroundColor3=C.Element,
         BorderSizePixel=0,LayoutOrder=NO_C(),Parent=cfgScroll,
     },{New("UICorner",{CornerRadius=UDim.new(0,7)})})
@@ -3096,29 +2976,26 @@ do
     nameBox:GetPropertyChangedSignal("Text"):Connect(function() cfgNameValue=nameBox.Text end)
     nameInputCon.MouseEnter:Connect(function() Tween(nameInputCon,T_FAST,{BackgroundColor3=C.ElemHov}) end)
     nameInputCon.MouseLeave:Connect(function() Tween(nameInputCon,T_FAST,{BackgroundColor3=C.Element}) end)
- 
-    -- Saved profiles header
+
     local sec2 = New("Frame",{Size=UDim2.new(1,0,0,26),BackgroundTransparency=1,LayoutOrder=NO_C(),Parent=cfgScroll})
     New("TextLabel",{Size=UDim2.fromScale(1,1),BackgroundTransparency=1,Text="SAVED PROFILES",
         Font=Enum.Font.GothamBold,TextSize=10,TextColor3=C.Accent,
         TextXAlignment=Enum.TextXAlignment.Left,ZIndex=3,Parent=sec2})
     New("Frame",{Size=UDim2.new(1,0,0,1),Position=UDim2.new(0,0,1,-1),
         BackgroundColor3=C.Border,BorderSizePixel=0,ZIndex=3,Parent=sec2})
- 
-    -- Dynamic list container
+
     local cfgListContainer = New("Frame",{
         Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y,
         BackgroundTransparency=1, LayoutOrder=NO_C(), Parent=cfgScroll,
     },{New("UIListLayout",{Padding=UDim.new(0,4),SortOrder=Enum.SortOrder.LayoutOrder,FillDirection=Enum.FillDirection.Vertical})})
- 
-    -- Status section
+
     local sec3 = New("Frame",{Size=UDim2.new(1,0,0,26),BackgroundTransparency=1,LayoutOrder=NO_C(),Parent=cfgScroll})
     New("TextLabel",{Size=UDim2.fromScale(1,1),BackgroundTransparency=1,Text="STATUS",
         Font=Enum.Font.GothamBold,TextSize=10,TextColor3=C.Accent,
         TextXAlignment=Enum.TextXAlignment.Left,ZIndex=3,Parent=sec3})
     New("Frame",{Size=UDim2.new(1,0,0,1),Position=UDim2.new(0,0,1,-1),
         BackgroundColor3=C.Border,BorderSizePixel=0,ZIndex=3,Parent=sec3})
- 
+
     local statusRow = New("Frame",{Size=UDim2.new(1,0,0,36),BackgroundColor3=C.Element,
         BorderSizePixel=0,LayoutOrder=NO_C(),Parent=cfgScroll,
     },{New("UICorner",{CornerRadius=UDim.new(0,7)})})
@@ -3128,10 +3005,9 @@ do
     local statusLabel = New("TextLabel",{Size=UDim2.new(0.6,-12,1,0),Position=UDim2.new(0.4,0,0,0),
         BackgroundTransparency=1,Text="none",Font=Enum.Font.GothamBold,
         TextSize=11,TextColor3=C.Accent,TextXAlignment=Enum.TextXAlignment.Right,ZIndex=3,Parent=statusRow})
- 
-    -- FIX: expose via upvalue so CFGAutoLoad can update it
+
     _cfgStatusLabel = statusLabel
- 
+
     New("TextLabel",{
         Size=UDim2.new(1,0,0,32),BackgroundTransparency=1,
         Text="Note: toggle features off/on after loading to refresh GUI visuals.",
@@ -3139,8 +3015,7 @@ do
         TextXAlignment=Enum.TextXAlignment.Left,TextWrapped=true,
         LayoutOrder=NO_C(),ZIndex=3,Parent=cfgScroll,
     })
- 
-    -- Refresh the dynamic profile list
+
     local function RefreshCFGList()
         for _, child in ipairs(cfgListContainer:GetChildren()) do
             if not child:IsA("UIListLayout") then child:Destroy() end
@@ -3167,7 +3042,6 @@ do
                 TextSize=11,TextColor3=C.Text,
                 TextXAlignment=Enum.TextXAlignment.Left,ZIndex=4,Parent=row,
             })
-            -- Load button
             local loadB = New("TextButton",{
                 Size=UDim2.fromOffset(36,22),Position=UDim2.new(1,-80,0.5,-11),
                 BackgroundColor3=C.AccentDim,BorderSizePixel=0,
@@ -3185,7 +3059,6 @@ do
             end)
             loadB.MouseEnter:Connect(function() Tween(loadB,T_FAST,{BackgroundColor3=C.Accent}) end)
             loadB.MouseLeave:Connect(function() Tween(loadB,T_FAST,{BackgroundColor3=C.AccentDim}) end)
-            -- Delete button
             local delB = New("TextButton",{
                 Size=UDim2.fromOffset(36,22),Position=UDim2.new(1,-40,0.5,-11),
                 BackgroundColor3=C.Red,BorderSizePixel=0,
@@ -3194,7 +3067,6 @@ do
             },{New("UICorner",{CornerRadius=UDim.new(0,5)})})
             delB.MouseButton1Click:Connect(function()
                 CFGDelete(name)
-                -- Clear status if it was showing the deleted config
                 if statusLabel.Text == name then statusLabel.Text = "none" end
                 PolarisNotify("Config","Deleted: "..name,2)
                 RefreshCFGList()
@@ -3203,8 +3075,7 @@ do
             delB.MouseLeave:Connect(function() Tween(delB,T_FAST,{BackgroundColor3=C.Red}) end)
         end
     end
- 
-    -- Save button
+
     local saveBtn = New("TextButton",{
         Size=UDim2.new(1,0,0,34),BackgroundColor3=C.Element,
         BorderSizePixel=0,LayoutOrder=NO_C(),Text="",Parent=cfgScroll,
@@ -3225,8 +3096,7 @@ do
     end)
     saveBtn.MouseEnter:Connect(function() Tween(saveBtn,T_FAST,{BackgroundColor3=C.ElemHov}) end)
     saveBtn.MouseLeave:Connect(function() Tween(saveBtn,T_FAST,{BackgroundColor3=C.Element}) end)
- 
-    -- Refresh button
+
     local refreshBtn = New("TextButton",{
         Size=UDim2.new(1,0,0,34),BackgroundColor3=C.Element,
         BorderSizePixel=0,LayoutOrder=NO_C(),Text="",Parent=cfgScroll,
@@ -3239,30 +3109,27 @@ do
     end)
     refreshBtn.MouseEnter:Connect(function() Tween(refreshBtn,T_FAST,{BackgroundColor3=C.ElemHov}) end)
     refreshBtn.MouseLeave:Connect(function() Tween(refreshBtn,T_FAST,{BackgroundColor3=C.Element}) end)
- 
+
     RefreshCFGList()
 end
- 
+
 -- ============================================================
 -- // OPEN DEFAULT TAB
 -- ============================================================
- 
+
 SwitchTab("Aimbot")
- 
+
 MainFrame.InputBegan:Connect(function(inp)
     if inp.UserInputType == Enum.UserInputType.MouseButton1 then
         local mp = UserInputService:GetMouseLocation()
         if not PointInAnyPopup(mp.X, mp.Y) then CloseAllPopups() end
     end
 end)
- 
+
 -- ============================================================
 -- // SHARED SLIDER INPUT TRACKER
 -- ============================================================
--- _activeSlide is declared near the top (in MISC STORAGE) so slider
--- callbacks and these listeners share the same upvalue.
--- These two listeners complete the slider drag/release logic.
- 
+
 UserInputService.InputChanged:Connect(function(inp)
     if not _activeSlide then return end
     if inp.UserInputType ~= Enum.UserInputType.MouseMovement then return end
@@ -3270,21 +3137,21 @@ UserInputService.InputChanged:Connect(function(inp)
     if not trk or not trk.Parent then _activeSlide = nil; return end
     _activeSlide.sv((inp.Position.X - trk.AbsolutePosition.X) / trk.AbsoluteSize.X)
 end)
- 
+
 UserInputService.InputEnded:Connect(function(inp)
     if inp.UserInputType == Enum.UserInputType.MouseButton1 then
         _activeSlide = nil
     end
 end)
- 
+
 -- ============================================================
--- // FOV CIRCLE  (follows mouse cursor)
+-- // FOV CIRCLE
 -- ============================================================
- 
+
 local FOV_SEGS = 64
 local FOVLines = {}
 local TWO_PI   = math.pi * 2
- 
+
 for i = 1, FOV_SEGS do
     local ln     = Drawing.new("Line")
     ln.Visible   = false
@@ -3297,7 +3164,7 @@ local _fovR   = -1
 local _fovCX  = -1
 local _fovCY  = -1
 local _fovCol = State.Aimbot.Color
- 
+
 local function UpdateFOVCircle(col, vis)
     if not vis then
         if _fovVis then
@@ -3323,28 +3190,28 @@ local function UpdateFOVCircle(col, vis)
         if not ln.Visible then ln.Visible=true end
     end
 end
- 
+
 -- ============================================================
--- // TRIGGERBOT CROSSHAIR  (viewport center)
+-- // TRIGGERBOT CROSSHAIR
 -- ============================================================
- 
+
 local TBCircle         = Drawing.new("Circle")
 TBCircle.Visible       = false
 TBCircle.Color         = Color3.fromRGB(255, 255, 255)
 TBCircle.Thickness     = 1
 TBCircle.NumSides      = 40
 TBCircle.Filled        = false
- 
+
 local TBCrossH         = Drawing.new("Line")
 TBCrossH.Visible       = false
 TBCrossH.Color         = Color3.fromRGB(255, 255, 255)
 TBCrossH.Thickness     = 1
- 
+
 local TBCrossV         = Drawing.new("Line")
 TBCrossV.Visible       = false
 TBCrossV.Color         = Color3.fromRGB(255, 255, 255)
 TBCrossV.Thickness     = 1
- 
+
 local TBDot            = Drawing.new("Circle")
 TBDot.Visible          = false
 TBDot.Color            = Color3.fromRGB(255, 255, 255)
@@ -3352,8 +3219,7 @@ TBDot.Thickness        = 1
 TBDot.Radius           = 2
 TBDot.NumSides         = 12
 TBDot.Filled           = true
- 
--- FIX: Register all Drawing objects so re-injection can clean them up.
+
 do
     local reg = {}
     for _, ln in ipairs(FOVLines) do table.insert(reg, ln) end
@@ -3363,7 +3229,7 @@ do
     table.insert(reg, TBDot)
     _G._PolarisDrawings = reg
 end
- 
+
 local function UpdateTBCrosshair()
     if not State.Triggerbot.Enabled then
         TBCircle.Visible = false
@@ -3374,56 +3240,48 @@ local function UpdateTBCrosshair()
     end
     local cx, cy = _vpCenter.X, _vpCenter.Y
     local r      = State.Triggerbot.Radius
-    local csz    = 8   -- half-length of crosshair tick marks
- 
+    local csz    = 8
+
     TBCircle.Position = Vector2.new(cx, cy)
     TBCircle.Radius   = r
     TBCircle.Visible  = true
- 
+
     TBCrossH.From    = Vector2.new(cx - csz, cy)
     TBCrossH.To      = Vector2.new(cx + csz, cy)
     TBCrossH.Visible = true
- 
+
     TBCrossV.From    = Vector2.new(cx, cy - csz)
     TBCrossV.To      = Vector2.new(cx, cy + csz)
     TBCrossV.Visible = true
- 
+
     TBDot.Position = Vector2.new(cx, cy)
     TBDot.Visible  = true
 end
- 
+
 -- ============================================================
 -- // MAIN RENDER LOOP
 -- ============================================================
- 
+
 Conn("RenderMain", RunService.RenderStepped:Connect(function(dt)
-    -- 1. Viewport center
     local cam = GetCamera()
     _vpCenter = Vector2.new(cam.ViewportSize.X * 0.5, cam.ViewportSize.Y * 0.5)
- 
-    -- 2. Rainbow hues (independent speeds for aimbot vs ESP)
+
     _rainbowHueAimbot = (_rainbowHueAimbot + dt * State.Aimbot.RainbowSpeed) % 1
     _rainbowHueESP    = (_rainbowHueESP    + dt * State.ESP.RainbowSpeed)    % 1
     local rainbowColAimbot = Color3.fromHSV(_rainbowHueAimbot, 1, 1)
     local rainbowColESP    = Color3.fromHSV(_rainbowHueESP,    1, 1)
- 
-    -- 3. FOV circle
+
     local fovCol = State.Aimbot.RainbowFOV and rainbowColAimbot or State.Aimbot.Color
     UpdateFOVCircle(fovCol, State.Aimbot.Enabled)
- 
-    -- 4. Triggerbot crosshair
+
     UpdateTBCrosshair()
- 
-    -- 5. Aimbot
+
     if State.Aimbot.Enabled then RunAimbot() end
- 
-    -- 6. Triggerbot
+
     RunTriggerbot(dt)
- 
-    -- 7. ESP
+
     UpdateESP(rainbowColESP)
- 
-    -- 8. FPS / watermark update (every 0.5 s)
+
     _fpsCount = _fpsCount + 1
     _fpsAccum = _fpsAccum + dt
     _wmAccum  = _wmAccum  + dt
@@ -3433,11 +3291,11 @@ Conn("RenderMain", RunService.RenderStepped:Connect(function(dt)
         end
         _fpsCount = 0; _fpsAccum = 0; _wmAccum = 0
         local ping = math.floor(LocalPlayer:GetNetworkPing() * 1000)
-        WatermarkLabel.Text = string.format("polaris.gov  |  %d fps  |  %d ms", _fpsCached, ping)
+        -- CHG v2.7.3: version shown in the watermark label
+        WatermarkLabel.Text = string.format("polaris.gov v2.7.3  |  %d fps  |  %d ms", _fpsCached, ping)
     end
 end))
- 
--- Location display
+
 Conn("LocUpdate", RunService.Heartbeat:Connect(function()
     local root = GetRoot(LocalPlayer)
     if root then
@@ -3447,43 +3305,35 @@ Conn("LocUpdate", RunService.Heartbeat:Connect(function()
         setLocZ(string.format("%.2f", p.Z))
     end
 end))
- 
+
 -- ============================================================
 -- // PLAYER & CHARACTER EVENTS
 -- ============================================================
- 
+
 Players.PlayerAdded:Connect(function(player)
     if State.ESP.Enabled then CreateESPForPlayer(player) end
- 
-    -- FIX: always register CharacterAdded regardless of Hitbox state;
-    -- the hitbox check happens inside the callback so future enables work correctly.
+
     player.CharacterAdded:Connect(function()
         task.wait(0.5)
-        -- ESP rebuild
         if State.ESP.Enabled then
             local d = ESPObjects[player]
-            if d then
-                -- Trigger skeleton rebuild on next update frame
-                d.lastChar = nil
-            end
+            if d then d.lastChar = nil end
         end
-        -- Hitbox rebuild
         RemoveHitboxForPlayer(player)
         if State.Hitbox.Enabled then BuildHitboxForPlayer(player) end
     end)
- 
-    -- Build hitbox for current character if already spawned
+
     if State.Hitbox.Enabled and player.Character then
         BuildHitboxForPlayer(player)
     end
 end)
- 
+
 Players.PlayerRemoving:Connect(function(player)
     local d = ESPObjects[player]
     if d then DestroyESPEntry(d); ESPObjects[player] = nil end
     RemoveHitboxForPlayer(player)
 end)
- 
+
 Mouse.Button1Down:Connect(function()
     local root = GetRoot(LocalPlayer); if not root then return end
     if State.Movement.ClickTP then
@@ -3501,13 +3351,13 @@ Mouse.Button1Down:Connect(function()
         tw.Completed:Connect(function() root.Anchored=false; TweenTPActive=false end)
     end
 end)
- 
+
 LocalPlayer.CharacterAdded:Connect(OnCharacterAdded)
- 
+
 -- ============================================================
 -- // STARTUP
 -- ============================================================
- 
+
 local _openSound        = Instance.new("Sound")
 _openSound.Name         = "PolarisOpen"
 _openSound.SoundId      = "rbxassetid://140528689236462"
@@ -3516,26 +3366,26 @@ _openSound.Looped       = false
 _openSound.Parent       = SoundService
 _openSound:Play()
 game:GetService("Debris"):AddItem(_openSound, 30)
- 
+
 -- ============================================================
 -- // LOADING SCREEN
 -- ============================================================
- 
+
 do
     local ls = New("Frame", {
         Size=UDim2.fromScale(1,1), BackgroundColor3=Color3.fromRGB(8,8,14),
         ZIndex=999, Parent=ScreenGui,
     })
-    local logoLabel = New("TextLabel", {
+    New("TextLabel", {
         Size=UDim2.new(1,0,0,48), Position=UDim2.new(0,0,0.38,0),
         BackgroundTransparency=1, Text="polaris.gov",
         Font=Enum.Font.GothamBold, TextSize=36, TextColor3=C.Accent,
         TextXAlignment=Enum.TextXAlignment.Center, ZIndex=1000, Parent=ls,
     })
-    local subLabel = New("TextLabel", {
+    New("TextLabel", {
         Size=UDim2.new(1,0,0,28), Position=UDim2.new(0,0,0.38,52),
         BackgroundTransparency=1,
-        Text="Welcome, " .. LocalPlayer.DisplayName .. "  ·  universal v2.7.2",
+        Text="Welcome, " .. LocalPlayer.DisplayName .. "  ·  universal v2.7.3",
         Font=Enum.Font.Gotham, TextSize=14, TextColor3=C.TextDim,
         TextXAlignment=Enum.TextXAlignment.Center, ZIndex=1000, Parent=ls,
     })
@@ -3547,7 +3397,6 @@ do
         Size=UDim2.fromOffset(0,3), BackgroundColor3=C.Accent,
         BorderSizePixel=0, ZIndex=1001, Parent=barBG,
     }, { New("UICorner",{CornerRadius=UDim.new(1,0)}) })
-    -- Animate bar fill over 4.5s then fade out
     Tween(barFil, TweenInfo.new(4.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
         { Size=UDim2.fromOffset(260,3) })
     task.delay(5.0, function()
@@ -3561,13 +3410,10 @@ do
         if ls and ls.Parent then ls:Destroy() end
     end)
 end
- 
+
 -- ============================================================
 -- // FINAL STARTUP
 -- ============================================================
- 
-PolarisNotify("polaris.gov", "universal v2.7.2 loaded", 4)
-print("[polaris.gov] universal v2.7.2 loaded")
- 
--- Autoload DISABLED (v2.7). Users load configs manually via the Configs tab.
--- task.delay(0.5, CFGAutoLoad)  -- kept as comment for reference
+
+PolarisNotify("polaris.gov", "universal v2.7.3 loaded", 4)
+print("[polaris.gov] universal v2.7.3 loaded")
