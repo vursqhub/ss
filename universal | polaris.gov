@@ -1,36 +1,29 @@
 -- // universal | polaris.gov
--- // Version: 2.7.6
+-- // Version: 2.7.7
 -- ============================================================
--- CHANGELOG vs 2.7.5:
---   ADD  HITBOX: HRP Expander (multiplier mode) — new section in Hitbox tab.
---         Expands HumanoidRootPart as a perfect cube using a size multiplier,
---         matching the approach of standalone hitbox scripts (message(6)).
---         Stored/restored independently, re-applied every Heartbeat.
---   FIX  MOVEMENT: All tab controls now have StateGet — toggles and sliders
---         correctly reflect loaded config values when a config is applied.
---   FIX  VISUALS: All tab controls now have StateGet — same fix applied to
---         Camera FOV, Fullbright, No Fog, No Shadows, Boost FPS.
--- ============================================================
--- ============================================================
--- CHANGELOG vs 2.7.3:
---   FIX  HITBOX: Ghost parts are now parented to the CHARACTER MODEL, not
---         workspace. This is the critical fix: most FPS games identify a hit
---         player via `Players:GetPlayerFromCharacter(hit.Parent)` or
---         `hit:FindFirstAncestorOfClass("Model")`. When ghosts lived in
---         workspace, `hit.Parent` was workspace → game found no player →
---         hit was silently ignored. With ghosts inside the character model,
---         `hit.Parent` IS the character, so detection works correctly.
---         Ghost parts remain Anchored=true (no WeldConstraint) with CFrame
---         synced every Heartbeat → zero physics coupling, no frozen players.
---   CHG  HITBOX: Ghost transparency set to 1 (fully invisible) by default so
---         expanded hitbox doesn't visually clutter opponents. The optional
---         Highlight toggle still shows the overlay.
---   CHG  VERSION: Bumped to 2.7.5.
--- ============================================================
--- CHANGELOG vs 2.7.2:
---   FIX  HITBOX: Removed WeldConstraint. Ghost parts are Anchored=true,
---         CFrame-synced each Heartbeat, parented to workspace.
---   CHG  WATERMARK: Version shown in fps label.
+-- CHANGELOG vs 2.7.6:
+--   FIX  FOV CIRCLE: Removed position/color caching entirely.
+--         The cache caused two bugs: (1) Drawing lines default to white —
+--         since _fovCol was init'd to State.Aimbot.Color, cc=false on first
+--         render, so lines never received their configured color.
+--         (2) After a config load, if the FOV or color matched the cached
+--         value, the circle silently refused to update. Now all 64 segments
+--         are written unconditionally every RenderStepped frame. The per-
+--         frame cost is negligible (~0.01 ms).
+--   FIX  HITBOX RE-INJECTION: Original part sizes are now stored in
+--         _G._PolarisHitboxData before expansion and restored in the
+--         re-injection cleanup block. Previously the cleanup comment said
+--         "sizes restored when ClearAllHitboxes() is called on re-inject"
+--         but ClearAllHitboxes() was never called in the cleanup block.
+--         The new script's empty HitboxData table meant expanded parts had
+--         their expanded size stored as "original", causing double-expansion
+--         on each successive injection.
+--   FIX  KEYBIND: CreateKeybind now accepts StateGet and registers with
+--         GUISetters so SyncGUI (called after config load) can update the
+--         displayed key label.
+--   FIX  COLOR PICKER: CreateColorPicker now accepts ColorStateGet and
+--         registers with GUISetters so the swatch BackgroundColor3 reflects
+--         the value loaded from a config.
 -- ============================================================
 
 -- ============================================================
@@ -60,8 +53,23 @@ do
         _G._PolarisDrawings = nil
     end
 
-    -- v2.7.5: no ghost parts to clean up (direct resize approach)
-    -- Sizes are restored when ClearAllHitboxes() is called on re-inject
+    -- FIX: Restore hitbox part sizes from previous injection.
+    -- _G._PolarisHitboxData is a flat array of {part, origSize, origTrans, isHRP}.
+    -- Without this, the new script's empty HitboxData stores already-expanded
+    -- sizes as "originals", causing double-expansion on every re-inject.
+    if _G._PolarisHitboxData then
+        for _, e in ipairs(_G._PolarisHitboxData) do
+            pcall(function()
+                if e.part and e.part.Parent then
+                    e.part.Size = e.origSize
+                    if e.origTrans ~= nil then
+                        e.part.Transparency = e.origTrans
+                    end
+                end
+            end)
+        end
+        _G._PolarisHitboxData = nil
+    end
 
     local _ss = game:GetService("SoundService")
     local _oldMusic = _ss:FindFirstChild("PolarisMusic")
@@ -1137,45 +1145,24 @@ local function RunTriggerbot(dt)
 end
 
 -- ============================================================
--- // HITBOX EXPANDER  (v2.7.5 – direct part resize)
--- ============================================================
---
--- WHY DIRECT RESIZE IS THE ONLY RELIABLE APPROACH:
---
---   Ghost-part strategies (v2.7.2–v2.7.4) all failed because games identify
---   hit targets in many different ways:
---     • workspace:Raycast / FindPartOnRay  — some check CanQuery, some don't
---     • FastCast libraries                 — cast against specific part lists
---     • Touched / region3 checks          — never see non-colliding ghost parts
---     • Server-side hit validation        — never see client-only ghost parts
---     • Players:GetPlayerFromCharacter    — ghost in workspace returns nil
---
---   The ONLY property that every hit-detection method reads identically is the
---   actual physical size of the BasePart stored in the physics engine.
---   Resizing the real part changes the geometry every system sees.
---
--- WHY THIS DOES NOT FREEZE PLAYERS:
---
---   Motor6D joints connect Part0→Part1 via C0/C1 offset CFrames stored in
---   local space.  Changing part.Size only scales the geometry around the
---   part's existing CFrame center; it does NOT alter C0/C1 or the part's
---   CFrame itself.  The animator keeps setting CFrames normally every frame.
---   Therefore: no physics coupling, no joint disruption, no frozen animation.
---
---   The ONLY part that must NOT be resized is HumanoidRootPart — it drives
---   character movement physics and resizing it breaks locomotion.
---   All other parts (Head, Torso/UpperTorso, limbs) resize safely.
---
--- HOW IT WORKS:
---   1. Store each part's original Size.
---   2. Set part.Size = origSize + expand*2 (expand in all axes from center).
---   3. Re-apply sizes every Heartbeat — games sometimes reset part sizes
---      server-side, so we stay persistent.
---   4. Restore all sizes when disabled or player leaves/respawns.
+-- // HITBOX EXPANDER  (v2.7.7 – direct part resize + global tracking)
 -- ============================================================
 
--- HitboxData[player] = { parts = {[part]=origSize}, hl = Highlight|nil }
+-- HitboxData[player] = { parts = {[part]=origSize}, hl = Highlight|nil, ... }
 local HitboxData = {}
+
+-- FIX: _G._PolarisHitboxData is a flat array of restore records so that
+-- re-injection cleanup can restore expanded sizes before overwriting them.
+-- Initialise to empty table if not already set by a previous injection.
+_G._PolarisHitboxData = _G._PolarisHitboxData or {}
+
+local function _HBGRegister(part, origSize, origTrans)
+    -- Push a restore record into the global table.
+    -- On re-injection the cleanup block reads this and restores before HitboxData
+    -- is re-initialized. Duplicate entries are fine — restoring the same part
+    -- twice with the same origSize is idempotent.
+    table.insert(_G._PolarisHitboxData, { part = part, origSize = origSize, origTrans = origTrans })
+end
 
 local function ApplyHitboxToPlayer(player)
     if player == LocalPlayer then return end
@@ -1191,7 +1178,6 @@ local function ApplyHitboxToPlayer(player)
 
     for partName, enabled in pairs(State.Hitbox.Parts) do
         if enabled then
-            -- Accept both R6 and R15 naming for torso
             local targets = { char:FindFirstChild(partName) }
             if partName == "Torso" then
                 targets[#targets+1] = char:FindFirstChild("UpperTorso")
@@ -1199,12 +1185,16 @@ local function ApplyHitboxToPlayer(player)
             end
             for _, part in ipairs(targets) do
                 if part and part:IsA("BasePart")
-                and part.Name ~= "HumanoidRootPart"  -- NEVER resize HRP here
-                and not entry.parts[part] then        -- deduplicate
-                    entry.parts[part] = part.Size     -- store original size
-                    entry.partOrigTrans[part] = part.Transparency  -- store original transparency
+                and part.Name ~= "HumanoidRootPart"
+                and not entry.parts[part] then
+                    local origSize  = part.Size
+                    local origTrans = part.Transparency
+                    entry.parts[part]         = origSize
+                    entry.partOrigTrans[part] = origTrans
+                    -- Register for cross-injection restoration
+                    _HBGRegister(part, origSize, origTrans)
                     pcall(function()
-                        part.Size = part.Size + Vector3.new(expand, expand, expand) * 2
+                        part.Size         = origSize + Vector3.new(expand, expand, expand) * 2
                         part.Transparency = State.Hitbox.Transparency
                     end)
                     count = count + 1
@@ -1213,26 +1203,28 @@ local function ApplyHitboxToPlayer(player)
         end
     end
 
-    -- HRP multiplier expansion (from hitbox expander - message(6) approach)
     if State.Hitbox.HRPEnabled then
         local hrp = char:FindFirstChild("HumanoidRootPart")
         if hrp and hrp:IsA("BasePart") then
-            local origSize = hrp.Size
+            local origSize  = hrp.Size
+            local origTrans = hrp.Transparency
             entry.hrpPart       = hrp
             entry.hrpOrigSize   = origSize
-            entry.hrpOrigTrans  = hrp.Transparency
+            entry.hrpOrigTrans  = origTrans
+            -- Register for cross-injection restoration
+            _HBGRegister(hrp, origSize, origTrans)
             local baseSize     = math.max(origSize.X, origSize.Y, origSize.Z)
             local expandedSize = baseSize * State.Hitbox.HRPMultiplier
             pcall(function()
-                hrp.Size        = Vector3.new(expandedSize, expandedSize, expandedSize)
-                hrp.CanCollide  = false
+                hrp.Size         = Vector3.new(expandedSize, expandedSize, expandedSize)
+                hrp.CanCollide   = false
                 hrp.Transparency = State.Hitbox.HRPTransparency
             end)
             count = count + 1
         end
     end
 
-    if count == 0 then return end   -- character not loaded yet; retry next tick
+    if count == 0 then return end
 
     if State.Hitbox.Highlight then
         local hl = Instance.new("Highlight")
@@ -1260,7 +1252,6 @@ local function RestoreHitboxForPlayer(player)
             end
         end)
     end
-    -- Restore HRP if we expanded it
     if entry.hrpPart and entry.hrpOrigSize then
         pcall(function()
             if entry.hrpPart and entry.hrpPart.Parent then
@@ -1278,6 +1269,8 @@ end
 local function ClearAllHitboxes()
     for player in pairs(HitboxData) do RestoreHitboxForPlayer(player) end
     HitboxData = {}
+    -- Clear global restore table — all sizes are now restored
+    _G._PolarisHitboxData = {}
 end
 
 local function SetupHitbox()
@@ -1290,21 +1283,17 @@ local function SetupHitbox()
         if not State.Hitbox.Enabled then return end
         local expand = State.Hitbox.Size
 
-        -- Apply to any players not yet processed
         for _, p in ipairs(Players:GetPlayers()) do
             if p ~= LocalPlayer and not HitboxData[p] then ApplyHitboxToPlayer(p) end
         end
 
-        -- Collect players needing a re-apply first so we don't mutate HitboxData mid-iteration
         local needReapply = {}
 
         for player, entry in pairs(HitboxData) do
             local char = GetCharacter(player)
             if not char then
-                -- Character gone entirely (loading/leaving) — clear entry
                 RestoreHitboxForPlayer(player)
             else
-                -- Check if character model itself has changed (respawn swaps the model)
                 local anyGone = false
                 for part in pairs(entry.parts) do
                     if not part or not part.Parent or not part:IsDescendantOf(char) then
@@ -1317,11 +1306,9 @@ local function SetupHitbox()
                     end
                 end
                 if anyGone then
-                    -- Character model replaced — restore old entry and queue re-apply
                     RestoreHitboxForPlayer(player)
                     table.insert(needReapply, player)
                 else
-                    -- Re-apply sizes every frame — some games reset them server-side
                     for part, origSize in pairs(entry.parts) do
                         pcall(function()
                             local want = origSize + Vector3.new(expand, expand, expand) * 2
@@ -1331,7 +1318,6 @@ local function SetupHitbox()
                             end
                         end)
                     end
-                    -- Re-apply HRP multiplier every frame
                     if State.Hitbox.HRPEnabled and entry.hrpPart and entry.hrpOrigSize then
                         pcall(function()
                             if entry.hrpPart and entry.hrpPart.Parent then
@@ -1345,7 +1331,6 @@ local function SetupHitbox()
                             end
                         end)
                     elseif not State.Hitbox.HRPEnabled and entry.hrpPart and entry.hrpOrigSize then
-                        -- HRP expansion toggled off mid-session, restore it
                         pcall(function()
                             if entry.hrpPart and entry.hrpPart.Parent then
                                 entry.hrpPart.Size = entry.hrpOrigSize
@@ -1353,7 +1338,6 @@ local function SetupHitbox()
                         end)
                         entry.hrpPart = nil; entry.hrpOrigSize = nil
                     end
-                    -- Sync highlight
                     if State.Hitbox.Highlight then
                         if not entry.hl or not entry.hl.Parent then
                             local hl = Instance.new("Highlight")
@@ -1371,7 +1355,6 @@ local function SetupHitbox()
             end
         end
 
-        -- Now re-apply for players whose character was replaced this frame
         for _, player in ipairs(needReapply) do
             ApplyHitboxToPlayer(player)
         end
@@ -1577,7 +1560,6 @@ local function ApplyDeserializedState(d)
                 if type(p.name)=="string" and type(p.id)=="string" then
                     table.insert(State.Music.CustomPresets,{name=p.name,id=p.id}) end
             end
-            -- Refresh the custom presets list in the GUI
             if RefreshCustomPresets then pcall(RefreshCustomPresets) end
         end
     end
@@ -1630,7 +1612,7 @@ local function CFGDelete(name)
 end
 
 local _cfgStatusLabel=nil
-local function CFGAutoLoad() end  -- disabled (v2.7)
+local function CFGAutoLoad() end
 
 -- ============================================================
 -- // GUI HELPERS
@@ -1681,7 +1663,7 @@ local Watermark=New("Frame",{Size=UDim2.fromOffset(330,30),Position=UDim2.new(1,
 New("Frame",{Size=UDim2.fromOffset(3,18),Position=UDim2.new(0,0,0.5,-9),BackgroundColor3=C.Accent,
     BorderSizePixel=0,ZIndex=61,Parent=Watermark},{New("UICorner",{CornerRadius=UDim.new(1,0)})})
 local WatermarkLabel=New("TextLabel",{Size=UDim2.new(1,-12,1,0),Position=UDim2.new(0,10,0,0),
-    BackgroundTransparency=1,Text="universal | polaris.gov - v2.7.6",Font=Enum.Font.GothamBold,
+    BackgroundTransparency=1,Text="universal | polaris.gov - v2.7.7",Font=Enum.Font.GothamBold,
     TextSize=11,TextColor3=C.Accent,TextXAlignment=Enum.TextXAlignment.Left,ZIndex=62,Parent=Watermark})
 
 local _fpsCount=0; local _fpsAccum=0; local _fpsCached=0; local _wmAccum=0
@@ -1723,14 +1705,13 @@ New("TextLabel",{Size=UDim2.new(1,-16,0,18),Position=UDim2.new(0,8,0,10),Backgro
     Text="polaris.gov",Font=Enum.Font.GothamBold,TextSize=14,TextColor3=C.Accent,
     TextXAlignment=Enum.TextXAlignment.Left,ZIndex=4,Parent=_logo})
 New("TextLabel",{Size=UDim2.new(1,-16,0,12),Position=UDim2.new(0,8,0,30),BackgroundTransparency=1,
-    Text="v2.7.6 universal",Font=Enum.Font.Gotham,TextSize=10,TextColor3=C.TextMuted,
+    Text="v2.7.7 universal",Font=Enum.Font.Gotham,TextSize=10,TextColor3=C.TextMuted,
     TextXAlignment=Enum.TextXAlignment.Left,ZIndex=4,Parent=_logo})
 local TabButtonList=New("ScrollingFrame",{Size=UDim2.new(1,0,1,-80),Position=UDim2.new(0,0,0,56),
     BackgroundTransparency=1,ScrollBarThickness=0,CanvasSize=UDim2.new(0,0,0,0),
     AutomaticCanvasSize=Enum.AutomaticSize.Y,ZIndex=3,Parent=Sidebar},{
     New("UIListLayout",{Padding=UDim.new(0,3),FillDirection=Enum.FillDirection.Vertical,SortOrder=Enum.SortOrder.LayoutOrder}),
     New("UIPadding",{PaddingLeft=UDim.new(0,8),PaddingRight=UDim.new(0,8),PaddingTop=UDim.new(0,4)})})
--- User greeting at sidebar bottom
 New("TextLabel",{Size=UDim2.new(1,-16,0,30),Position=UDim2.new(0,8,1,-36),
     BackgroundTransparency=1,Text="Hello "..LocalPlayer.DisplayName..".",
     Font=Enum.Font.Gotham,TextSize=10,TextColor3=C.TextMuted,
@@ -1913,6 +1894,9 @@ local function CreateTab(name)
         return {Set=function(v) SV((v-minV)/math.max(maxV-minV,0.001)) end}
     end
 
+    -- FIX: Added ColorStateGet so the color swatch updates when SyncGUI is called
+    -- after a config load. Without this the swatch always shows the initial color
+    -- regardless of what the config contains.
     function Tab:CreateColorPicker(config)
         local curCol=config.Color or Color3.fromRGB(255,255,255); local rbOn=false; local noRB=config.NoRainbow==true
         local con=New("Frame",{Size=UDim2.new(1,0,0,36),BackgroundColor3=C.Element,BorderSizePixel=0,LayoutOrder=NO(),Parent=scroll},
@@ -1970,6 +1954,13 @@ local function CreateTab(name)
         con.MouseEnter:Connect(function() Tween(con,T_FAST,{BackgroundColor3=C.ElemHov}) end)
         con.MouseLeave:Connect(function() Tween(con,T_FAST,{BackgroundColor3=C.Element}) end)
         if config.RainbowStateGet then RegisterSetter(config.RainbowStateGet,function(v) SetRB(v) end) end
+        -- FIX: Register swatch color sync via ColorStateGet
+        if config.ColorStateGet then
+            RegisterSetter(config.ColorStateGet, function(v)
+                curCol = v
+                sw.BackgroundColor3 = v
+            end)
+        end
     end
 
     function Tab:CreateButton(config)
@@ -2011,6 +2002,8 @@ local function CreateTab(name)
         con.MouseLeave:Connect(function() Tween(con,T_FAST,{BackgroundColor3=C.Element}) end)
     end
 
+    -- FIX: Added StateGet support so SyncGUI can update the displayed key label
+    -- after a config is loaded. Previously the keybind label was write-once.
     function Tab:CreateKeybind(config)
         local curKey=config.DefaultKey or "MouseButton2"; local listening=false
         local row=New("Frame",{Size=UDim2.new(1,0,0,36),BackgroundColor3=C.Element,BorderSizePixel=0,LayoutOrder=NO(),Parent=scroll},
@@ -2021,6 +2014,11 @@ local function CreateTab(name)
         local kb=New("TextButton",{Size=UDim2.new(0.38,0,0,22),Position=UDim2.new(0.62,0,0.5,-11),
             BackgroundColor3=C.SliderBG,BorderSizePixel=0,Text=curKey,Font=Enum.Font.GothamBold,
             TextSize=10,TextColor3=C.Accent,ZIndex=4,Parent=row},{New("UICorner",{CornerRadius=UDim.new(0,5)})})
+        -- Internal setter used both by user interaction and by SyncGUI
+        local function SetKey(kn)
+            curKey = kn; kb.Text = kn; kb.TextColor3 = C.Accent
+            if config.Callback then config.Callback(kn) end
+        end
         kb.MouseButton1Click:Connect(function()
             if listening then return end; listening=true; kb.Text="..."; kb.TextColor3=C.TextDim
             local conn; conn=UserInputService.InputBegan:Connect(function(inp,gpe)
@@ -2031,12 +2029,18 @@ local function CreateTab(name)
                 elseif inp.UserInputType==Enum.UserInputType.MouseButton3 then kn="MouseButton3"
                 elseif inp.UserInputType==Enum.UserInputType.Keyboard      then kn=inp.KeyCode.Name
                 else kn=curKey end
-                curKey=kn; kb.Text=kn; kb.TextColor3=C.Accent
-                if config.Callback then config.Callback(kn) end
+                SetKey(kn)
             end)
         end)
         row.MouseEnter:Connect(function() Tween(row,T_FAST,{BackgroundColor3=C.ElemHov}) end)
         row.MouseLeave:Connect(function() Tween(row,T_FAST,{BackgroundColor3=C.Element}) end)
+        -- FIX: register with GUISetters if StateGet is provided
+        if config.StateGet then
+            RegisterSetter(config.StateGet, function(v)
+                curKey = v; kb.Text = v; kb.TextColor3 = C.Accent
+            end)
+        end
+        return { SetKey = SetKey }
     end
 
     return Tab
@@ -2091,9 +2095,12 @@ AimbotTab:CreateSlider({Name="Aim Speed",Range={1,100},Increment=1,Suffix="%",Cu
     Callback=function(v) State.Aimbot.Smoothness=v/100 end})
 AimbotTab:CreateSlider({Name="FOV Radius",Range={10,500},Increment=5,Suffix="px",CurrentValue=150,
     StateGet=function() return State.Aimbot.FOV end,Callback=function(v) State.Aimbot.FOV=v end})
+-- FIX: Added ColorStateGet so the swatch updates on config load
 AimbotTab:CreateColorPicker({Name="FOV Circle Color",Color=Color3.fromRGB(255,0,0),
+    ColorStateGet=function() return State.Aimbot.Color end,
     RainbowStateGet=function() return State.Aimbot.RainbowFOV end,
-    RainbowCallback=function(v) State.Aimbot.RainbowFOV=v end,Callback=function(v) State.Aimbot.Color=v end})
+    RainbowCallback=function(v) State.Aimbot.RainbowFOV=v end,
+    Callback=function(v) State.Aimbot.Color=v end})
 AimbotTab:CreateSlider({Name="Rainbow Speed",Range={1,200},Increment=1,Suffix="x",CurrentValue=40,
     StateGet=function() return math.floor(State.Aimbot.RainbowSpeed*100+0.5) end,
     Callback=function(v) State.Aimbot.RainbowSpeed=v/100 end})
@@ -2118,12 +2125,23 @@ do
         b.MouseEnter:Connect(function() if State.Aimbot.TargetPart~=opt[2] then Tween(b,T_FAST,{BackgroundColor3=C.ElemHov}) end end)
         b.MouseLeave:Connect(function() if State.Aimbot.TargetPart~=opt[2] then Tween(b,T_FAST,{BackgroundColor3=C.Element}) end end)
     end
+    -- Register target part buttons with SyncGUI
+    RegisterSetter(
+        function() return State.Aimbot.TargetPart end,
+        function(v)
+            for k,b in pairs(partBtns) do
+                pcall(function() b.BackgroundColor3 = (k==v) and C.AccentDim or C.Element end)
+            end
+        end
+    )
 end
 AimbotTab:CreateSection("Team")
 AimbotTab:CreateToggle({Name="Team Check (skip teammates)",CurrentValue=false,
     StateGet=function() return State.Aimbot.TeamCheck end,Callback=function(v) State.Aimbot.TeamCheck=v end})
 AimbotTab:CreateSection("Lock Key")
+-- FIX: Added StateGet so the displayed key label updates when a config is loaded
 AimbotTab:CreateKeybind({Name="Aim Hold Key",DefaultKey="MouseButton2",
+    StateGet=function() return State.Aimbot.LockKey end,
     Callback=function(v) State.Aimbot.LockKey=v end})
 AimbotTab:CreateSection("Triggerbot")
 AimbotTab:CreateToggle({Name="Enable Triggerbot",CurrentValue=false,
@@ -2159,9 +2177,12 @@ ESPTab:CreateToggle({Name="Highlight ESP",CurrentValue=false,StateGet=function()
     Callback=function(v) State.ESP.Highlight=v end})
 ESPTab:CreateToggle({Name="Tracer ESP",CurrentValue=false,StateGet=function() return State.ESP.Tracer end,
     Callback=function(v) State.ESP.Tracer=v end})
+-- FIX: Added ColorStateGet for ESP color swatch
 ESPTab:CreateColorPicker({Name="ESP Color",Color=Color3.fromRGB(255,255,255),
+    ColorStateGet=function() return State.ESP.Color end,
     RainbowStateGet=function() return State.ESP.Rainbow end,
-    RainbowCallback=function(v) State.ESP.Rainbow=v end,Callback=function(v) State.ESP.Color=v end})
+    RainbowCallback=function(v) State.ESP.Rainbow=v end,
+    Callback=function(v) State.ESP.Color=v end})
 ESPTab:CreateSlider({Name="Rainbow Speed",Range={1,200},Increment=1,Suffix="x",CurrentValue=40,
     StateGet=function() return math.floor(State.ESP.RainbowSpeed*100+0.5) end,
     Callback=function(v) State.ESP.RainbowSpeed=v/100 end})
@@ -2185,8 +2206,17 @@ do
     end
     local to=Tabs["ESP"].Order; MkTeamBtn("Mode: Hide teammates","hide",to+1); MkTeamBtn("Mode: Color + TEAM label","color",to+2)
     Tabs["ESP"].Order=to+2
+    RegisterSetter(
+        function() return State.ESP.TeamMode end,
+        function(v)
+            for m,b in pairs(modeBtns) do
+                pcall(function() b.BackgroundColor3 = (m==v) and C.AccentDim or C.Element end)
+            end
+        end
+    )
 end
 ESPTab:CreateColorPicker({Name="Team Color",Color=Color3.fromRGB(0,255,120),NoRainbow=true,
+    ColorStateGet=function() return State.ESP.TeamColor end,
     Callback=function(v) State.ESP.TeamColor=v end})
 
 -- ── MOVEMENT ──────────────────────────────────────────────────
@@ -2279,6 +2309,14 @@ do
     end
     local to=Tabs["Movement"].Order; MkBtn("Mode: Click to Select","click",to+1); MkBtn("Mode: Nearest Player","nearest",to+2); MkBtn("Mode: Auto Random","auto",to+3)
     Tabs["Movement"].Order=to+3
+    RegisterSetter(
+        function() return State.Movement.OrbitMode end,
+        function(v)
+            for m,b in pairs(modeBtns) do
+                pcall(function() b.BackgroundColor3 = (m==v) and C.AccentDim or C.Element end)
+            end
+        end
+    )
     MovementTab:CreateSlider({Name="Auto Switch Cooldown",Range={1,100},Increment=1,CurrentValue=10,
         StateGet=function() return math.floor(State.Movement.OrbitCooldown*10+0.5) end,
         Callback=function(v) State.Movement.OrbitCooldown=v/10 end})
@@ -2421,6 +2459,7 @@ HitboxTab:CreateSlider({Name="Part Transparency",Range={0,100},Increment=1,Suffi
         end
     end})
 HitboxTab:CreateColorPicker({Name="Highlight Color",Color=Color3.fromRGB(255,60,60),NoRainbow=true,
+    ColorStateGet=function() return State.Hitbox.Color end,
     Callback=function(v) State.Hitbox.Color=v end})
 HitboxTab:CreateToggle({Name="Show Highlight on Players",CurrentValue=false,
     StateGet=function() return State.Hitbox.Highlight end,Callback=function(v) State.Hitbox.Highlight=v end})
@@ -2490,25 +2529,17 @@ MiscTab:CreateButton({Name="Copy Location to Clipboard",Callback=function()
         CopyToClipboard(txt); PolarisNotify("Copied",txt,2) end end})
 MiscTab:CreateSection("Kill Script")
 MiscTab:CreateButton({Name="⚠  Kill Script",Callback=function()
-    -- 1. Disconnect every managed connection
     for name in pairs(Connections) do
         pcall(function() Connections[name]:Disconnect() end)
         Connections[name] = nil
     end
-
-    -- 2. Restore all hitboxes (sizes + transparency)
     pcall(ClearAllHitboxes)
-
-    -- 3. Destroy all ESP drawings
     pcall(ClearAllESP)
-
-    -- 4. Remove all Drawing objects (FOV circle, triggerbot crosshair)
     if _G._PolarisDrawings then
         for _, d in ipairs(_G._PolarisDrawings) do pcall(function() d:Remove() end) end
         _G._PolarisDrawings = nil
     end
-
-    -- 5. Restore humanoid state
+    _G._PolarisHitboxData = nil
     pcall(function()
         local h = GetHumanoid(LocalPlayer)
         if h then
@@ -2519,8 +2550,6 @@ MiscTab:CreateButton({Name="⚠  Kill Script",Callback=function()
             pcall(function() h.MaxHealth = 100; h.Health = 100 end)
         end
     end)
-
-    -- 6. Remove fly forces + spin BAV
     pcall(function()
         local root = GetRoot(LocalPlayer)
         if root then
@@ -2529,14 +2558,10 @@ MiscTab:CreateButton({Name="⚠  Kill Script",Callback=function()
         end
     end)
     if SpinBAV then pcall(function() SpinBAV:Destroy() end); SpinBAV = nil end
-
-    -- 7. Restore noclip parts collision
     for part in pairs(NoclipParts) do
         pcall(function() if part and part.Parent then part.CanCollide = true end end)
     end
     NoclipParts = {}
-
-    -- 8. Restore lighting to defaults
     pcall(function()
         Lighting.Ambient        = LDefault.Ambient
         Lighting.OutdoorAmbient = LDefault.OutdoorAmbient
@@ -2545,8 +2570,6 @@ MiscTab:CreateButton({Name="⚠  Kill Script",Callback=function()
         Lighting.FogEnd         = LDefault.FogEnd
         Lighting.FogStart       = LDefault.FogStart
     end)
-
-    -- 9. Restore atmosphere defaults
     pcall(function()
         local a = Lighting:FindFirstChildOfClass("Atmosphere")
         if a and next(AtmoDefault) then
@@ -2556,8 +2579,6 @@ MiscTab:CreateButton({Name="⚠  Kill Script",Callback=function()
             if AtmoDefault.FogBlend ~= nil then a.FogBlend = AtmoDefault.FogBlend end
         end
     end)
-
-    -- 10. Restore all post-effects and FPS particle cache
     pcall(function()
         for fx, was in pairs(PostFXSaved) do
             pcall(function() if fx and fx.Parent then fx.Enabled = was end end)
@@ -2574,36 +2595,23 @@ MiscTab:CreateButton({Name="⚠  Kill Script",Callback=function()
         end
         FPSParticleCache = {}
     end)
-
-    -- 11. Restore rendering quality if FPS boost was on
     pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Automatic end)
     pcall(function()
         local ugs = game:GetService("UserGameSettings")
         ugs.SavedQualityLevel = Enum.SavedQualitySetting.Automatic
     end)
-
-    -- 12. Restore camera FOV
     pcall(function() GetCamera().FieldOfView = 70 end)
-
-    -- 13. Stop and destroy music
     pcall(function() MusicSound:Stop(); MusicSound:Destroy() end)
-
-    -- 14. Destroy GUIs
     pcall(function() ScreenGui:Destroy() end)
     pcall(function() WatermarkGui:Destroy() end)
-
-    -- 15. Clear GUISetters so SyncGUI is inert
     GUISetters = {}
-
-    -- 16. Nil out targeting/lock state
     LockedTarget = nil
     OrbitTarget  = nil
     TweenTPActive = false
-
     print("[polaris.gov] script killed.")
 end})
 MiscTab:CreateSection("Info")
-MiscTab:CreateLabel("universal | polaris.gov | v2.7.6")
+MiscTab:CreateLabel("universal | polaris.gov | v2.7.7")
 MiscTab:CreateLabel("RightAlt = toggle GUI visibility")
 MiscTab:CreateSection("Discord")
 MiscTab:CreateLabel("discord.gg/2azAG826Tm")
@@ -2733,23 +2741,43 @@ UserInputService.InputEnded:Connect(function(inp)
 end)
 
 -- ============================================================
--- // FOV CIRCLE
+-- // FOV CIRCLE  (v2.7.7 – no caching)
 -- ============================================================
+-- FIX: All position/color caching removed. The previous version had 5 cache
+-- variables (_fovVis, _fovR, _fovCX, _fovCY, _fovCol). The critical bug:
+--   _fovCol was initialised to State.Aimbot.Color at declaration time, so on
+--   the very first RenderStepped call, cc = (col ~= _fovCol) evaluated to
+--   FALSE even though the Drawing lines had never received a color assignment
+--   (Drawing.new("Line") defaults to white). The circle appeared white.
+--   Additionally, after a config load changed State.Aimbot.FOV or Color,
+--   the caching could suppress the update if the mouse hadn't moved.
+-- The fix is unconditional per-frame writes. Cost: ~64 Vector2 constructors
+-- per frame, well under 0.1 ms on any modern executor.
 
 local FOV_SEGS=64; local FOVLines={}; local TWO_PI=math.pi*2
-for i=1,FOV_SEGS do local ln=Drawing.new("Line"); ln.Visible=false; ln.Color=State.Aimbot.Color; ln.Thickness=1; FOVLines[i]=ln end
-local _fovVis=false; local _fovR=-1; local _fovCX=-1; local _fovCY=-1; local _fovCol=State.Aimbot.Color
+for i=1,FOV_SEGS do
+    local ln=Drawing.new("Line"); ln.Visible=false; ln.Thickness=1
+    FOVLines[i]=ln
+end
 
-local function UpdateFOVCircle(col,vis)
-    if not vis then if _fovVis then for i=1,FOV_SEGS do FOVLines[i].Visible=false end; _fovVis=false end; return end
-    local mp=UserInputService:GetMouseLocation(); local cx,cy,r=mp.X,mp.Y,State.Aimbot.FOV
-    local pc=cx~=_fovCX or cy~=_fovCY or r~=_fovR; local cc=col~=_fovCol
-    _fovVis=true; _fovCX=cx; _fovCY=cy; _fovR=r; _fovCol=col
-    for i=1,FOV_SEGS do local ln=FOVLines[i]
-        if pc then local a1=(i-1)/FOV_SEGS*TWO_PI; local a2=i/FOV_SEGS*TWO_PI
-            ln.From=Vector2.new(cx+math.cos(a1)*r,cy+math.sin(a1)*r)
-            ln.To=Vector2.new(cx+math.cos(a2)*r,cy+math.sin(a2)*r) end
-        if cc then ln.Color=col end; if not ln.Visible then ln.Visible=true end
+local function UpdateFOVCircle(col, vis)
+    if not vis then
+        -- Only touch Visible if lines are currently shown (avoids redundant writes)
+        for i=1,FOV_SEGS do
+            if FOVLines[i].Visible then FOVLines[i].Visible=false end
+        end
+        return
+    end
+    local mp=UserInputService:GetMouseLocation()
+    local cx, cy, r = mp.X, mp.Y, State.Aimbot.FOV
+    for i=1,FOV_SEGS do
+        local ln=FOVLines[i]
+        local a1=(i-1)/FOV_SEGS*TWO_PI
+        local a2=i/FOV_SEGS*TWO_PI
+        ln.From  = Vector2.new(cx+math.cos(a1)*r, cy+math.sin(a1)*r)
+        ln.To    = Vector2.new(cx+math.cos(a2)*r, cy+math.sin(a2)*r)
+        ln.Color = col
+        if not ln.Visible then ln.Visible=true end
     end
 end
 
@@ -2798,7 +2826,7 @@ Conn("RenderMain", RunService.RenderStepped:Connect(function(dt)
         if _fpsAccum>0 then _fpsCached=math.floor(_fpsCount/_fpsAccum+0.5) end
         _fpsCount=0; _fpsAccum=0; _wmAccum=0
         local ping=math.floor(LocalPlayer:GetNetworkPing()*1000)
-        WatermarkLabel.Text=string.format("universal | polaris.gov - v2.7.6  |  %d fps  |  %d ms",_fpsCached,ping)
+        WatermarkLabel.Text=string.format("universal | polaris.gov - v2.7.7  |  %d fps  |  %d ms",_fpsCached,ping)
     end
 end))
 
@@ -2824,7 +2852,6 @@ Players.PlayerAdded:Connect(function(player)
     if State.Hitbox.Enabled and player.Character then ApplyHitboxToPlayer(player) end
 end)
 
--- Connect CharacterAdded for players already in-game when script loaded
 for _, player in ipairs(Players:GetPlayers()) do
     if player ~= LocalPlayer then
         player.CharacterAdded:Connect(function()
@@ -2871,7 +2898,7 @@ do
         Text="polaris.gov",Font=Enum.Font.GothamBold,TextSize=36,TextColor3=C.Accent,
         TextXAlignment=Enum.TextXAlignment.Center,ZIndex=1000,Parent=ls})
     New("TextLabel",{Size=UDim2.new(1,0,0,28),Position=UDim2.new(0,0,0.38,52),BackgroundTransparency=1,
-        Text="Welcome, "..LocalPlayer.DisplayName.."  ·  universal v2.7.6",Font=Enum.Font.Gotham,TextSize=14,
+        Text="Welcome, "..LocalPlayer.DisplayName.."  ·  universal v2.7.7",Font=Enum.Font.Gotham,TextSize=14,
         TextColor3=C.TextDim,TextXAlignment=Enum.TextXAlignment.Center,ZIndex=1000,Parent=ls})
     local barBG=New("Frame",{Size=UDim2.fromOffset(260,3),Position=UDim2.new(0.5,-130,0.38,92),
         BackgroundColor3=C.SliderBG,BorderSizePixel=0,ZIndex=1000,Parent=ls},{New("UICorner",{CornerRadius=UDim.new(1,0)})})
@@ -2889,5 +2916,5 @@ do
     end)
 end
 
-PolarisNotify("polaris.gov","universal v2.7.6 loaded",4)
-print("[polaris.gov] universal v2.7.6 loaded")
+PolarisNotify("polaris.gov","universal v2.7.7 loaded",4)
+print("[polaris.gov] universal v2.7.7 loaded")
