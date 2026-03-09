@@ -1,5 +1,21 @@
 -- // universal | polaris.gov
--- // Version: 2.7.7
+-- // Version: 2.7.8
+-- ============================================================
+-- CHANGELOG vs 2.7.7:
+--   ADD  MOVEMENT: Hover Player — click a player (or use Nearest mode)
+--         and your character lerp-tweens to hover above them, continuously
+--         following. Height (0–30 st) and Speed (1–100) are adjustable.
+--         Two modes: Click to Select (click near a player's model) and
+--         Nearest Player (auto-targets closest alive player each frame).
+--   FIX  ESP / ALL DRAWINGS: Replaced the manual _G._PolarisDrawings list
+--         with _G._PolarisAllDrawings and a TrackDrawing() wrapper that
+--         intercepts every Drawing.new() call. Previously only FOV lines and
+--         triggerbot drawings were tracked; ESP Box/Name/Distance/Tracer/
+--         Skeleton/TeamLabel Drawing objects were invisible to cleanup, so
+--         they persisted across re-injections and rendered at stale positions
+--         on top of the new script's freshly-created drawings, causing all
+--         ESP visuals to appear broken/missing after the first re-inject.
+--         Now every Drawing is tracked and removed cleanly on re-injection.
 -- ============================================================
 -- CHANGELOG vs 2.7.6:
 --   FIX  FOV CIRCLE: Removed position/color caching entirely.
@@ -46,11 +62,15 @@ do
         end
     end
 
-    if _G._PolarisDrawings then
-        for _, d in ipairs(_G._PolarisDrawings) do
+    -- FIX: _G._PolarisAllDrawings tracks EVERY Drawing.new() call (ESP Box,
+    -- Name, Distance, Tracer, Skeleton lines, FOV circle, triggerbot, etc).
+    -- Previously only FOV+TB drawings were in _G._PolarisDrawings; ESP drawings
+    -- persisted across re-injections and caused visual corruption.
+    if _G._PolarisAllDrawings then
+        for _, d in ipairs(_G._PolarisAllDrawings) do
             pcall(function() d:Remove() end)
         end
-        _G._PolarisDrawings = nil
+        _G._PolarisAllDrawings = nil
     end
 
     -- FIX: Restore hitbox part sizes from previous injection.
@@ -126,8 +146,21 @@ local function CopyToClipboard(text)
 end
 
 -- ============================================================
--- // DEFAULTS
+-- // DRAWING TRACKER
 -- ============================================================
+-- Every Drawing.new() call goes through TrackDrawing() so that ALL Drawing
+-- objects (ESP, FOV circle, triggerbot, etc) are registered in the global
+-- cleanup table. On re-injection the cleanup block removes every one of them,
+-- preventing stale drawings from overlapping fresh ones.
+
+_G._PolarisAllDrawings = _G._PolarisAllDrawings or {}
+local function TrackDrawing(drawType)
+    local d = Drawing.new(drawType)
+    table.insert(_G._PolarisAllDrawings, d)
+    return d
+end
+
+
 
 local Defaults = { WalkSpeed = 16, JumpPower = 50 }
 local function RefreshDefaults()
@@ -221,6 +254,10 @@ local State = {
         OrbitRadius       = 5,
         OrbitMode         = "click",
         OrbitCooldown     = 1,
+        HoverPlayer       = false,
+        HoverHeight       = 8,
+        HoverSpeed        = 20,
+        HoverMode         = "click",
     },
     Music = {
         ID            = "",
@@ -538,7 +575,7 @@ local function RebuildSkeleton(d, char)
     d.Skeleton = {}
     d.lastChar = char
     for _, pair in ipairs(GetSkelPairs(char)) do
-        local ln     = Drawing.new("Line")
+        local ln     = TrackDrawing("Line")
         ln.Visible   = false
         ln.Color     = State.ESP.Color
         ln.Thickness = 1
@@ -578,27 +615,27 @@ local function CreateESPForPlayer(player)
     local col = State.ESP.Color
     local d   = {}
 
-    d.Box              = Drawing.new("Square")
+    d.Box              = TrackDrawing("Square")
     d.Box.Visible      = false
     d.Box.Color        = col
     d.Box.Thickness    = 1
     d.Box.Filled       = false
 
-    d.Name             = Drawing.new("Text")
+    d.Name             = TrackDrawing("Text")
     d.Name.Visible     = false
     d.Name.Color       = col
     d.Name.Size        = 14
     d.Name.Center      = true
     d.Name.Outline     = true
 
-    d.Distance         = Drawing.new("Text")
+    d.Distance         = TrackDrawing("Text")
     d.Distance.Visible = false
     d.Distance.Color   = col
     d.Distance.Size    = 12
     d.Distance.Center  = true
     d.Distance.Outline = true
 
-    d.Tracer           = Drawing.new("Line")
+    d.Tracer           = TrackDrawing("Line")
     d.Tracer.Visible   = false
     d.Tracer.Color     = col
     d.Tracer.Thickness = 1
@@ -609,7 +646,7 @@ local function CreateESPForPlayer(player)
     d.Highlight.FillColor           = col
     d.Highlight.OutlineColor        = col
 
-    d.TeamLabel         = Drawing.new("Text")
+    d.TeamLabel         = TrackDrawing("Text")
     d.TeamLabel.Visible = false
     d.TeamLabel.Color   = State.ESP.TeamColor
     d.TeamLabel.Size    = 13
@@ -1109,8 +1146,75 @@ local function SetupOrbit()
 end
 
 -- ============================================================
--- // TRIGGERBOT
+-- // HOVER PLAYER
 -- ============================================================
+
+local HoverTarget = nil
+
+local function SetupHoverPlayer()
+    Drop("HoverPlayer"); Drop("HoverClick")
+    HoverTarget = nil
+    if not State.Movement.HoverPlayer then return end
+
+    if State.Movement.HoverMode == "click" then
+        Conn("HoverClick", Mouse.Button1Down:Connect(function()
+            if not State.Movement.HoverPlayer then return end
+            -- Don't steal click from other features
+            if State.Movement.ClickTP or State.Movement.ClickTweenTP then return end
+            local hit = Mouse.Hit; if not hit then return end
+            local best, bestD = nil, math.huge
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= LocalPlayer and IsAlive(p) then
+                    local r = GetRoot(p)
+                    if r then
+                        local d = (r.Position - hit.Position).Magnitude
+                        if d < 12 and d < bestD then bestD = d; best = p end
+                    end
+                end
+            end
+            if best then
+                HoverTarget = best
+                PolarisNotify("Hover", "Hovering: " .. (best.DisplayName or best.Name), 2)
+            end
+        end))
+    end
+
+    Conn("HoverPlayer", RunService.Heartbeat:Connect(function(dt)
+        if not State.Movement.HoverPlayer then return end
+        local root = GetRoot(LocalPlayer); if not root then return end
+
+        if State.Movement.HoverMode == "nearest" then
+            local best, bestD = nil, math.huge
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= LocalPlayer and IsAlive(p) then
+                    local r = GetRoot(p)
+                    if r then
+                        local d = (r.Position - root.Position).Magnitude
+                        if d < bestD then bestD = d; best = p end
+                    end
+                end
+            end
+            HoverTarget = best
+        end
+
+        if not HoverTarget or not IsAlive(HoverTarget) then HoverTarget = nil; return end
+        local tr = GetRoot(HoverTarget); if not tr then return end
+
+        -- Target position: directly above the player's HRP
+        local targetPos = tr.Position + Vector3.new(0, State.Movement.HoverHeight, 0)
+        -- Face the same direction as the target (flat on Y)
+        local look = tr.CFrame.LookVector
+        local flatLook = Vector3.new(look.X, 0, look.Z)
+        if flatLook.Magnitude < 0.01 then flatLook = Vector3.new(0, 0, 1) end
+        local targetCF = CFrame.new(targetPos, targetPos + flatLook)
+
+        -- Lerp towards target — speed controls how fast we catch up
+        local alpha = math.clamp(State.Movement.HoverSpeed * dt, 0, 1)
+        root.CFrame = root.CFrame:Lerp(targetCF, alpha)
+    end))
+end
+
+
 
 local function SimulateLMBClick()
     if mouse1click then pcall(mouse1click)
@@ -1145,7 +1249,7 @@ local function RunTriggerbot(dt)
 end
 
 -- ============================================================
--- // HITBOX EXPANDER  (v2.7.7 – direct part resize + global tracking)
+-- // HITBOX EXPANDER  (v2.7.8 – direct part resize + global tracking)
 -- ============================================================
 
 -- HitboxData[player] = { parts = {[part]=origSize}, hl = Highlight|nil, ... }
@@ -1382,6 +1486,7 @@ local function OnCharacterAdded()
     if State.Movement.GodMode   then SetupGodMode()   end
     if State.Movement.InfJump   then SetupInfJump()   end
     if State.Movement.Noclip    then SetupNoclip()     end
+    if State.Movement.HoverPlayer then SetupHoverPlayer() end
 end
 
 -- ============================================================
@@ -1442,7 +1547,9 @@ local function SerializeState()
             Noclip=State.Movement.Noclip,GodMode=State.Movement.GodMode,
             Orbit=State.Movement.Orbit,OrbitSpeed=State.Movement.OrbitSpeed,
             OrbitRadius=State.Movement.OrbitRadius,OrbitMode=State.Movement.OrbitMode,
-            OrbitCooldown=State.Movement.OrbitCooldown},
+            OrbitCooldown=State.Movement.OrbitCooldown,
+            HoverPlayer=State.Movement.HoverPlayer,HoverHeight=State.Movement.HoverHeight,
+            HoverSpeed=State.Movement.HoverSpeed,HoverMode=State.Movement.HoverMode},
         Triggerbot={Enabled=State.Triggerbot.Enabled,Spam=State.Triggerbot.Spam,
             WallCheck=State.Triggerbot.WallCheck,TeamCheck=State.Triggerbot.TeamCheck,
             Radius=State.Triggerbot.Radius,Delay=State.Triggerbot.Delay},
@@ -1519,6 +1626,10 @@ local function ApplyDeserializedState(d)
         if m.OrbitMode~=nil         then State.Movement.OrbitMode=m.OrbitMode                         end
         if m.OrbitCooldown~=nil     then State.Movement.OrbitCooldown=m.OrbitCooldown                 end
         if m.Orbit~=nil             then State.Movement.Orbit=m.Orbit; SetupOrbit()                  end
+        if m.HoverHeight~=nil       then State.Movement.HoverHeight=m.HoverHeight                     end
+        if m.HoverSpeed~=nil        then State.Movement.HoverSpeed=m.HoverSpeed                       end
+        if m.HoverMode~=nil         then State.Movement.HoverMode=m.HoverMode                         end
+        if m.HoverPlayer~=nil       then State.Movement.HoverPlayer=m.HoverPlayer; SetupHoverPlayer() end
         ApplyWalkSpeed()
         local _h2=GetHumanoid(LocalPlayer)
         if _h2 and State.Movement.JumpPower then _h2.JumpPower=State.Movement.JumpPowerValue end
@@ -1663,7 +1774,7 @@ local Watermark=New("Frame",{Size=UDim2.fromOffset(330,30),Position=UDim2.new(1,
 New("Frame",{Size=UDim2.fromOffset(3,18),Position=UDim2.new(0,0,0.5,-9),BackgroundColor3=C.Accent,
     BorderSizePixel=0,ZIndex=61,Parent=Watermark},{New("UICorner",{CornerRadius=UDim.new(1,0)})})
 local WatermarkLabel=New("TextLabel",{Size=UDim2.new(1,-12,1,0),Position=UDim2.new(0,10,0,0),
-    BackgroundTransparency=1,Text="universal | polaris.gov - v2.7.7",Font=Enum.Font.GothamBold,
+    BackgroundTransparency=1,Text="universal | polaris.gov - v2.7.8",Font=Enum.Font.GothamBold,
     TextSize=11,TextColor3=C.Accent,TextXAlignment=Enum.TextXAlignment.Left,ZIndex=62,Parent=Watermark})
 
 local _fpsCount=0; local _fpsAccum=0; local _fpsCached=0; local _wmAccum=0
@@ -1705,7 +1816,7 @@ New("TextLabel",{Size=UDim2.new(1,-16,0,18),Position=UDim2.new(0,8,0,10),Backgro
     Text="polaris.gov",Font=Enum.Font.GothamBold,TextSize=14,TextColor3=C.Accent,
     TextXAlignment=Enum.TextXAlignment.Left,ZIndex=4,Parent=_logo})
 New("TextLabel",{Size=UDim2.new(1,-16,0,12),Position=UDim2.new(0,8,0,30),BackgroundTransparency=1,
-    Text="v2.7.7 universal",Font=Enum.Font.Gotham,TextSize=10,TextColor3=C.TextMuted,
+    Text="v2.7.8 universal",Font=Enum.Font.Gotham,TextSize=10,TextColor3=C.TextMuted,
     TextXAlignment=Enum.TextXAlignment.Left,ZIndex=4,Parent=_logo})
 local TabButtonList=New("ScrollingFrame",{Size=UDim2.new(1,0,1,-80),Position=UDim2.new(0,0,0,56),
     BackgroundTransparency=1,ScrollBarThickness=0,CanvasSize=UDim2.new(0,0,0,0),
@@ -2322,6 +2433,47 @@ do
         Callback=function(v) State.Movement.OrbitCooldown=v/10 end})
 end
 
+-- ── HOVER PLAYER ─────────────────────────────────────────────
+
+MovementTab:CreateSection("Hover Player")
+MovementTab:CreateLabel("Hover above a player and follow them. Click mode: click near their model.")
+MovementTab:CreateToggle({Name="Hover Player",CurrentValue=false,
+    StateGet=function() return State.Movement.HoverPlayer end,
+    Callback=function(v) State.Movement.HoverPlayer=v; SetupHoverPlayer() end})
+MovementTab:CreateSlider({Name="Hover Height",Range={0,30},Increment=1,Suffix=" st",CurrentValue=8,
+    StateGet=function() return State.Movement.HoverHeight end,
+    Callback=function(v) State.Movement.HoverHeight=v end})
+MovementTab:CreateSlider({Name="Follow Speed",Range={1,100},Increment=1,CurrentValue=20,
+    StateGet=function() return State.Movement.HoverSpeed end,
+    Callback=function(v) State.Movement.HoverSpeed=v end})
+do
+    local hoverModeBtns={}
+    local function SelHoverMode(mode)
+        State.Movement.HoverMode=mode
+        for m,b in pairs(hoverModeBtns) do Tween(b,T_FAST,{BackgroundColor3=m==mode and C.AccentDim or C.Element}) end
+        if State.Movement.HoverPlayer then SetupHoverPlayer() end
+    end
+    local ms=Tabs["Movement"].Scroll
+    local function MkHBtn(lbl,modeKey,lo)
+        local b=New("TextButton",{Size=UDim2.new(1,0,0,30),BackgroundColor3=modeKey=="click" and C.AccentDim or C.Element,
+            BorderSizePixel=0,LayoutOrder=lo,Text=lbl,Font=Enum.Font.Gotham,TextSize=11,
+            TextColor3=C.Text,Parent=ms},{New("UICorner",{CornerRadius=UDim.new(0,6)})})
+        hoverModeBtns[modeKey]=b; b.MouseButton1Click:Connect(function() SelHoverMode(modeKey) end)
+        b.MouseEnter:Connect(function() if State.Movement.HoverMode~=modeKey then Tween(b,T_FAST,{BackgroundColor3=C.ElemHov}) end end)
+        b.MouseLeave:Connect(function() if State.Movement.HoverMode~=modeKey then Tween(b,T_FAST,{BackgroundColor3=C.Element}) end end)
+    end
+    local to=Tabs["Movement"].Order; MkHBtn("Mode: Click to Select","click",to+1); MkHBtn("Mode: Nearest Player","nearest",to+2)
+    Tabs["Movement"].Order=to+2
+    RegisterSetter(
+        function() return State.Movement.HoverMode end,
+        function(v)
+            for m,b in pairs(hoverModeBtns) do
+                pcall(function() b.BackgroundColor3=(m==v) and C.AccentDim or C.Element end)
+            end
+        end
+    )
+end
+
 -- ── MUSIC ─────────────────────────────────────────────────────
 
 MusicTab:CreateSection("Built-in Presets")
@@ -2535,9 +2687,9 @@ MiscTab:CreateButton({Name="⚠  Kill Script",Callback=function()
     end
     pcall(ClearAllHitboxes)
     pcall(ClearAllESP)
-    if _G._PolarisDrawings then
-        for _, d in ipairs(_G._PolarisDrawings) do pcall(function() d:Remove() end) end
-        _G._PolarisDrawings = nil
+    if _G._PolarisAllDrawings then
+        for _, d in ipairs(_G._PolarisAllDrawings) do pcall(function() d:Remove() end) end
+        _G._PolarisAllDrawings = nil
     end
     _G._PolarisHitboxData = nil
     pcall(function()
@@ -2607,11 +2759,12 @@ MiscTab:CreateButton({Name="⚠  Kill Script",Callback=function()
     GUISetters = {}
     LockedTarget = nil
     OrbitTarget  = nil
+    HoverTarget  = nil
     TweenTPActive = false
     print("[polaris.gov] script killed.")
 end})
 MiscTab:CreateSection("Info")
-MiscTab:CreateLabel("universal | polaris.gov | v2.7.7")
+MiscTab:CreateLabel("universal | polaris.gov | v2.7.8")
 MiscTab:CreateLabel("RightAlt = toggle GUI visibility")
 MiscTab:CreateSection("Discord")
 MiscTab:CreateLabel("discord.gg/2azAG826Tm")
@@ -2741,7 +2894,7 @@ UserInputService.InputEnded:Connect(function(inp)
 end)
 
 -- ============================================================
--- // FOV CIRCLE  (v2.7.7 – no caching)
+-- // FOV CIRCLE  (v2.7.8 – no caching)
 -- ============================================================
 -- FIX: All position/color caching removed. The previous version had 5 cache
 -- variables (_fovVis, _fovR, _fovCX, _fovCY, _fovCol). The critical bug:
@@ -2756,7 +2909,7 @@ end)
 
 local FOV_SEGS=64; local FOVLines={}; local TWO_PI=math.pi*2
 for i=1,FOV_SEGS do
-    local ln=Drawing.new("Line"); ln.Visible=false; ln.Thickness=1
+    local ln=TrackDrawing("Line"); ln.Visible=false; ln.Thickness=1
     FOVLines[i]=ln
 end
 
@@ -2785,16 +2938,11 @@ end
 -- // TRIGGERBOT CROSSHAIR
 -- ============================================================
 
-local TBCircle=Drawing.new("Circle"); TBCircle.Visible=false; TBCircle.Color=Color3.fromRGB(255,255,255); TBCircle.Thickness=1; TBCircle.NumSides=40; TBCircle.Filled=false
-local TBCrossH=Drawing.new("Line"); TBCrossH.Visible=false; TBCrossH.Color=Color3.fromRGB(255,255,255); TBCrossH.Thickness=1
-local TBCrossV=Drawing.new("Line"); TBCrossV.Visible=false; TBCrossV.Color=Color3.fromRGB(255,255,255); TBCrossV.Thickness=1
-local TBDot=Drawing.new("Circle"); TBDot.Visible=false; TBDot.Color=Color3.fromRGB(255,255,255); TBDot.Thickness=1; TBDot.Radius=2; TBDot.NumSides=12; TBDot.Filled=true
+local TBCircle=TrackDrawing("Circle"); TBCircle.Visible=false; TBCircle.Color=Color3.fromRGB(255,255,255); TBCircle.Thickness=1; TBCircle.NumSides=40; TBCircle.Filled=false
+local TBCrossH=TrackDrawing("Line"); TBCrossH.Visible=false; TBCrossH.Color=Color3.fromRGB(255,255,255); TBCrossH.Thickness=1
+local TBCrossV=TrackDrawing("Line"); TBCrossV.Visible=false; TBCrossV.Color=Color3.fromRGB(255,255,255); TBCrossV.Thickness=1
+local TBDot=TrackDrawing("Circle"); TBDot.Visible=false; TBDot.Color=Color3.fromRGB(255,255,255); TBDot.Thickness=1; TBDot.Radius=2; TBDot.NumSides=12; TBDot.Filled=true
 
-do
-    local reg={}; for _,ln in ipairs(FOVLines) do table.insert(reg,ln) end
-    table.insert(reg,TBCircle); table.insert(reg,TBCrossH); table.insert(reg,TBCrossV); table.insert(reg,TBDot)
-    _G._PolarisDrawings=reg
-end
 
 local function UpdateTBCrosshair()
     if not State.Triggerbot.Enabled then TBCircle.Visible=false; TBCrossH.Visible=false; TBCrossV.Visible=false; TBDot.Visible=false; return end
@@ -2826,7 +2974,7 @@ Conn("RenderMain", RunService.RenderStepped:Connect(function(dt)
         if _fpsAccum>0 then _fpsCached=math.floor(_fpsCount/_fpsAccum+0.5) end
         _fpsCount=0; _fpsAccum=0; _wmAccum=0
         local ping=math.floor(LocalPlayer:GetNetworkPing()*1000)
-        WatermarkLabel.Text=string.format("universal | polaris.gov - v2.7.7  |  %d fps  |  %d ms",_fpsCached,ping)
+        WatermarkLabel.Text=string.format("universal | polaris.gov - v2.7.8  |  %d fps  |  %d ms",_fpsCached,ping)
     end
 end))
 
@@ -2898,7 +3046,7 @@ do
         Text="polaris.gov",Font=Enum.Font.GothamBold,TextSize=36,TextColor3=C.Accent,
         TextXAlignment=Enum.TextXAlignment.Center,ZIndex=1000,Parent=ls})
     New("TextLabel",{Size=UDim2.new(1,0,0,28),Position=UDim2.new(0,0,0.38,52),BackgroundTransparency=1,
-        Text="Welcome, "..LocalPlayer.DisplayName.."  ·  universal v2.7.7",Font=Enum.Font.Gotham,TextSize=14,
+        Text="Welcome, "..LocalPlayer.DisplayName.."  ·  universal v2.7.8",Font=Enum.Font.Gotham,TextSize=14,
         TextColor3=C.TextDim,TextXAlignment=Enum.TextXAlignment.Center,ZIndex=1000,Parent=ls})
     local barBG=New("Frame",{Size=UDim2.fromOffset(260,3),Position=UDim2.new(0.5,-130,0.38,92),
         BackgroundColor3=C.SliderBG,BorderSizePixel=0,ZIndex=1000,Parent=ls},{New("UICorner",{CornerRadius=UDim.new(1,0)})})
@@ -2916,5 +3064,5 @@ do
     end)
 end
 
-PolarisNotify("polaris.gov","universal v2.7.7 loaded",4)
-print("[polaris.gov] universal v2.7.7 loaded")
+PolarisNotify("polaris.gov","universal v2.7.8 loaded",4)
+print("[polaris.gov] universal v2.7.8 loaded")
