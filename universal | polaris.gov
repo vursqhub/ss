@@ -1,14 +1,23 @@
 -- // universal | polaris.gov
--- // Version: 2.8.0
+-- // Version: 2.8.1
+-- ============================================================
+-- CHANGELOG vs 2.8.0:
+--   FIX  ESP BROKEN: Direct Drawing property access (d.Box.Visible=false) in
+--         the UpdateESPPlayer hide-pass can throw on invalid/removed Drawing
+--         objects. The throw was caught by pcall(UpdateESPPlayer) in UpdateESP,
+--         silently killing the entire function before any drawing was shown.
+--         Restored pcall guards on every Drawing access in the hide pass.
+--   FIX  New() lost per-property pcall guard in v2.8.0 optimisation. A single
+--         bad property (read-only, API mismatch) threw and destroyed the entire
+--         GUI element, including the "Enable ESP" toggle itself. Restored.
+--   ADD  VISUALS → World: No Grass toggle (workspace.Terrain.Decoration).
 -- ============================================================
 -- CHANGELOG vs 2.7.9:
 --   OPT  Cached math locals (floor/clamp/cos/sin/rad/max/min/huge/pi) at top.
---   OPT  New() rewrites: single pcall wrapper per prop instead of per-key pcall.
+--   OPT  New() rewrites: reduced pcall overhead per prop.
 --   OPT  FOV circle: pre-compute segment angles table once at load.
---   OPT  ESP: removed redundant double-hide pass at start of UpdateESPPlayer.
 --   OPT  Removed all informational CreateLabel() calls throughout GUI tabs
---         except the RightAlt keybind notice in Misc. Reduces element count
---         and canvas size recalculations on every tab switch.
+--         except the RightAlt keybind notice in Misc.
 --   CHG  Load screen background transparency set to 0.6 (was 0 / opaque).
 -- ============================================================
 
@@ -259,6 +268,7 @@ local State = {
     NoFog      = false,
     NoShadows  = false,
     FPSBoost   = false,
+    NoGrass    = false,
     AntiFling  = false,
     Triggerbot = {
         Enabled   = false,
@@ -658,13 +668,16 @@ local function SetupESP()
 end
 
 local function UpdateESPPlayer(player, d, selfRoot, rainbowCol)
-    -- Hide all elements; only re-show what's valid this frame
-    d.Box.Visible       = false
-    d.Name.Visible      = false
-    d.Distance.Visible  = false
-    d.Tracer.Visible    = false
-    d.TeamLabel.Visible = false
-    for _, s in next, d.Skeleton do s.line.Visible = false end
+    -- BUG FIX v2.8.1: Direct Drawing property access can throw on invalid/removed
+    -- objects. The throw is caught by pcall(UpdateESPPlayer) in UpdateESP,
+    -- silently killing the entire function before any drawing gets shown.
+    -- Restored pcall on every Drawing access in the hide pass.
+    pcall(function() d.Box.Visible       = false end)
+    pcall(function() d.Name.Visible      = false end)
+    pcall(function() d.Distance.Visible  = false end)
+    pcall(function() d.Tracer.Visible    = false end)
+    pcall(function() d.TeamLabel.Visible = false end)
+    for _, s in ipairs(d.Skeleton) do pcall(function() s.line.Visible = false end) end
 
     local char = GetCharacter(player)
     local root, hum, head
@@ -869,6 +882,13 @@ end
 
 local function SetupNoShadows()
     Lighting.GlobalShadows = not State.NoShadows and LDefault.GlobalShadows or false
+end
+
+local function SetupNoGrass()
+    -- Terrain.Decoration controls whether grass/shrubs render on terrain.
+    pcall(function()
+        workspace.Terrain.Decoration = not State.NoGrass
+    end)
 end
 
 local function SetupFPSBoost()
@@ -1238,7 +1258,7 @@ local function RunTriggerbot(dt)
 end
 
 -- ============================================================
--- // HITBOX EXPANDER  (v2.8.0 – unchanged from 2.7.8)
+-- // HITBOX EXPANDER  (v2.8.1 – unchanged from 2.7.8)
 -- ============================================================
 
 local HitboxData = {}
@@ -1538,7 +1558,7 @@ local function SerializeState()
         Music={ID=State.Music.ID,Volume=State.Music.Volume,Pitch=State.Music.Pitch,
             Looped=State.Music.Looped,CustomPresets=cps},
         Fullbright=State.Fullbright,NoFog=State.NoFog,NoShadows=State.NoShadows,
-        FPSBoost=State.FPSBoost,AntiFling=State.AntiFling,CameraFOV=State.CameraFOV,
+        FPSBoost=State.FPSBoost,NoGrass=State.NoGrass,AntiFling=State.AntiFling,CameraFOV=State.CameraFOV,
     }
 end
 
@@ -1655,6 +1675,7 @@ local function ApplyDeserializedState(d)
     if d.NoFog~=nil      then State.NoFog=d.NoFog;           SetupNoFog()      end
     if d.NoShadows~=nil  then State.NoShadows=d.NoShadows;   SetupNoShadows()  end
     if d.FPSBoost~=nil   then State.FPSBoost=d.FPSBoost;     SetupFPSBoost()   end
+    if d.NoGrass~=nil    then State.NoGrass=d.NoGrass;       SetupNoGrass()    end
     if d.AntiFling~=nil  then State.AntiFling=d.AntiFling;   SetupAntiFling()  end
     if d.CameraFOV~=nil  then
         State.CameraFOV=d.CameraFOV
@@ -1710,10 +1731,14 @@ local function CFGAutoLoad() end
 -- ============================================================
 
 local function New(class, props, children)
-    local inst = Instance.new(class)
+    -- BUG FIX v2.8.1: Direct property assignment can throw for read-only or
+    -- API-mismatched properties. Without pcall, the entire element creation
+    -- fails (e.g. the "Enable ESP" toggle never gets built → can't turn ESP on).
+    local ok, inst = pcall(Instance.new, class)
+    if not ok or not inst then return nil end
     if props then
         for k, v in next, props do
-            inst[k] = v
+            pcall(function() inst[k] = v end)
         end
     end
     if children then
@@ -1762,7 +1787,7 @@ local Watermark=New("Frame",{Size=UDim2.fromOffset(330,30),Position=UDim2.new(1,
 New("Frame",{Size=UDim2.fromOffset(3,18),Position=UDim2.new(0,0,0.5,-9),BackgroundColor3=C.Accent,
     BorderSizePixel=0,ZIndex=61,Parent=Watermark},{New("UICorner",{CornerRadius=UDim.new(1,0)})})
 local WatermarkLabel=New("TextLabel",{Size=UDim2.new(1,-12,1,0),Position=UDim2.new(0,10,0,0),
-    BackgroundTransparency=1,Text="universal | polaris.gov - v2.8.0",Font=Enum.Font.GothamBold,
+    BackgroundTransparency=1,Text="universal | polaris.gov - v2.8.1",Font=Enum.Font.GothamBold,
     TextSize=11,TextColor3=C.Accent,TextXAlignment=Enum.TextXAlignment.Left,ZIndex=62,Parent=Watermark})
 
 local _fpsCount=0; local _fpsAccum=0; local _fpsCached=0; local _wmAccum=0
@@ -1804,7 +1829,7 @@ New("TextLabel",{Size=UDim2.new(1,-16,0,18),Position=UDim2.new(0,8,0,10),Backgro
     Text="polaris.gov",Font=Enum.Font.GothamBold,TextSize=14,TextColor3=C.Accent,
     TextXAlignment=Enum.TextXAlignment.Left,ZIndex=4,Parent=_logo})
 New("TextLabel",{Size=UDim2.new(1,-16,0,12),Position=UDim2.new(0,8,0,30),BackgroundTransparency=1,
-    Text="v2.8.0 universal",Font=Enum.Font.Gotham,TextSize=10,TextColor3=C.TextMuted,
+    Text="v2.8.1 universal",Font=Enum.Font.Gotham,TextSize=10,TextColor3=C.TextMuted,
     TextXAlignment=Enum.TextXAlignment.Left,ZIndex=4,Parent=_logo})
 local TabButtonList=New("ScrollingFrame",{Size=UDim2.new(1,0,1,-80),Position=UDim2.new(0,0,0,56),
     BackgroundTransparency=1,ScrollBarThickness=0,CanvasSize=UDim2.new(0,0,0,0),
@@ -2557,6 +2582,10 @@ VisualTab:CreateSection("Performance")
 VisualTab:CreateToggle({Name="Boost FPS",CurrentValue=false,
     StateGet=function() return State.FPSBoost end,
     Callback=function(v) State.FPSBoost=v; SetupFPSBoost() end})
+VisualTab:CreateSection("World")
+VisualTab:CreateToggle({Name="No Grass",CurrentValue=false,
+    StateGet=function() return State.NoGrass end,
+    Callback=function(v) State.NoGrass=v; SetupNoGrass() end})
 
 -- ── HITBOX ────────────────────────────────────────────────────
 
@@ -2856,7 +2885,7 @@ UserInputService.InputEnded:Connect(function(inp)
 end)
 
 -- ============================================================
--- // FOV CIRCLE  (v2.8.0 – no caching, cam-guarded)
+-- // FOV CIRCLE  (v2.8.1 – no caching, cam-guarded)
 -- ============================================================
 
 local FOV_SEGS = 64
@@ -2911,7 +2940,7 @@ local function UpdateTBCrosshair()
 end
 
 -- ============================================================
--- // MAIN RENDER LOOP  (v2.8.0 – camera nil-guard)
+-- // MAIN RENDER LOOP  (v2.8.1 – camera nil-guard)
 -- ============================================================
 -- FIX: The loop now checks GetCamera() at the very top and returns early if nil.
 -- Previously, `cam.ViewportSize` on a nil cam caused an unrecoverable error
@@ -2938,7 +2967,7 @@ Conn("RenderMain", RunService.RenderStepped:Connect(function(dt)
         _fpsCount=0; _fpsAccum=0; _wmAccum=0
         local ping = 0
         pcall(function() ping = mfloor(LocalPlayer:GetNetworkPing()*1000) end)
-        WatermarkLabel.Text=string.format("universal | polaris.gov - v2.8.0  |  %d fps  |  %d ms",_fpsCached,ping)
+        WatermarkLabel.Text=string.format("universal | polaris.gov - v2.8.1  |  %d fps  |  %d ms",_fpsCached,ping)
     end
 end))
 
@@ -3010,7 +3039,7 @@ do
         Text="polaris.gov",Font=Enum.Font.GothamBold,TextSize=36,TextColor3=C.Accent,
         TextXAlignment=Enum.TextXAlignment.Center,ZIndex=1000,Parent=ls})
     New("TextLabel",{Size=UDim2.new(1,0,0,28),Position=UDim2.new(0,0,0.38,52),BackgroundTransparency=1,
-        Text="Welcome, "..LocalPlayer.DisplayName.."  ·  universal v2.8.0",Font=Enum.Font.Gotham,TextSize=14,
+        Text="Welcome, "..LocalPlayer.DisplayName.."  ·  universal v2.8.1",Font=Enum.Font.Gotham,TextSize=14,
         TextColor3=C.TextDim,TextXAlignment=Enum.TextXAlignment.Center,ZIndex=1000,Parent=ls})
     local barBG=New("Frame",{Size=UDim2.fromOffset(260,3),Position=UDim2.new(0.5,-130,0.38,92),
         BackgroundColor3=C.SliderBG,BorderSizePixel=0,ZIndex=1000,Parent=ls},{New("UICorner",{CornerRadius=UDim.new(1,0)})})
@@ -3028,5 +3057,5 @@ do
     end)
 end
 
-PolarisNotify("polaris.gov","universal v2.8.0 loaded",4)
-print("[polaris.gov] universal v2.8.0 loaded")
+PolarisNotify("polaris.gov","universal v2.8.1 loaded",4)
+print("[polaris.gov] universal v2.8.1 loaded")
